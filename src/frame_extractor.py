@@ -94,6 +94,57 @@ def _is_braw(video_path: str) -> bool:
     return Path(video_path).suffix.lower() == ".braw"
 
 
+# ffprobe color_transfer values that indicate log encoding (footage will
+# look flat / desaturated by design and Claude should not be told the
+# scene is dim or gloomy on that basis).
+_LOG_TRANSFER_TAGS = {
+    "log316":          "Sony S-Log3",
+    "smpte428":        "SMPTE 428-1 Cinema",
+    "smpte2084":       "PQ (HDR)",
+    "arib-std-b67":    "HLG (HDR)",
+    "bt1361e":         "BT.1361",
+    "iec61966-2-4":    "xvYCC",
+    "apple-log":       "Apple Log",
+}
+
+# Camera-vendor strings sometimes show up in container tags (Format
+# Description, Encoder, Compression Name) when the color_transfer field
+# is missing. Used as a secondary signal.
+_LOG_TAG_HINTS = (
+    ("s-log3",   "Sony S-Log3"),
+    ("slog3",    "Sony S-Log3"),
+    ("logc4",    "ARRI LogC4"),
+    ("logc3",    "ARRI LogC3"),
+    ("log-c",    "ARRI LogC"),
+    ("v-log",    "Panasonic V-Log"),
+    ("vlog",     "Panasonic V-Log"),
+    ("n-log",    "Nikon N-Log"),
+    ("clog2",    "Canon Log 2"),
+    ("clog3",    "Canon Log 3"),
+    ("c-log",    "Canon Log"),
+    ("apple log","Apple Log"),
+)
+
+
+def _detect_log_color_space(stream_info: dict) -> Optional[str]:
+    """Return a friendly label for the source color space if log/HDR detected.
+
+    Reads color_transfer first (most reliable), falls back to scanning
+    tag strings for camera-vendor log markers. Returns None for plain
+    Rec.709 / sRGB / unmarked footage.
+    """
+    transfer = (stream_info.get("color_transfer") or "").lower()
+    if transfer and transfer in _LOG_TRANSFER_TAGS:
+        return _LOG_TRANSFER_TAGS[transfer]
+
+    tags = stream_info.get("tags") or {}
+    haystack = " ".join(str(v).lower() for v in tags.values())
+    for hint, label in _LOG_TAG_HINTS:
+        if hint in haystack:
+            return label
+    return None
+
+
 class FrameExtractor:
     CANVAS_W = 5760
     CANVAS_H = 4320
@@ -152,7 +203,8 @@ class FrameExtractor:
         try:
             r = subprocess.run(
                 [_FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name,width,height",
+                 "-show_entries",
+                 "stream=codec_name,width,height,color_space,color_transfer,color_primaries:stream_tags",
                  "-of", "json", video_path],
                 capture_output=True, text=True, timeout=30,
             )
@@ -160,11 +212,17 @@ class FrameExtractor:
                 return {}
             streams = json.loads(r.stdout).get("streams", [])
             s = streams[0] if streams else {}
-            return {
-                "codec": s.get("codec_name", "unknown"),
-                "width": s.get("width", 0),
-                "height": s.get("height", 0),
+            color_label = _detect_log_color_space(s)
+            info = {
+                "codec":         s.get("codec_name", "unknown"),
+                "width":         s.get("width", 0),
+                "height":        s.get("height", 0),
+                "color_space":   s.get("color_space"),
+                "color_transfer":s.get("color_transfer"),
             }
+            if color_label:
+                info["color_label"] = color_label
+            return info
         except Exception as e:
             logger.warning(f"Video info error: {e}")
             return {}
@@ -229,7 +287,14 @@ class FrameExtractor:
         res_str = (f"{video_info['width']}x{video_info['height']}"
                    if video_info.get("width") else "? res")
         codec = video_info.get("codec", "?")
-        text = f"{name}  |  {dur_m}:{dur_s:02d}  |  {fps_str}  |  {res_str}  |  {codec}"
+        color_label = video_info.get("color_label")
+        if color_label:
+            text = (
+                f"{name}  |  {dur_m}:{dur_s:02d}  |  {fps_str}  |  {res_str}  "
+                f"|  {codec}  |  COLOR: {color_label} (log/HDR -- flat by design)"
+            )
+        else:
+            text = f"{name}  |  {dur_m}:{dur_s:02d}  |  {fps_str}  |  {res_str}  |  {codec}"
         draw.text((16, (height - 22) // 2), text, font=font, fill=fg)
         return img
 
