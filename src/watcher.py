@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EXTENSIONS = {
     ".mp4", ".mov", ".m4v", ".mxf", ".avi", ".mkv", ".mts", ".m2ts",
-    ".prores", ".dnxhd", ".dnxhr",
+    ".prores", ".dnxhd", ".dnxhr", ".braw",
 }
 
 STABILITY_SECONDS = 3.0

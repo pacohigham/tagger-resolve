@@ -73,6 +73,11 @@ def cmd_validate(cfg: Config) -> int:
     print(f"Tagger for Resolve {VERSION}")
     print("ffmpeg/ffprobe:", "OK" if test_ffmpeg() else "MISSING")
     print("proxy:         ", "OK" if test_proxy_connection(cfg.proxy_url) else "FAIL")
+    try:
+        from braw_extractor import is_braw_available
+        print("BRAW SDK:      ", "OK" if is_braw_available() else "not installed (.braw files will be skipped)")
+    except Exception as e:
+        print(f"BRAW SDK:       ERROR ({e})")
     info = describe_resolve()
     print("resolve:")
     for k, v in info.items():

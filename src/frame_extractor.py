@@ -90,6 +90,10 @@ def _get_font(size: int = 36):
         return ImageFont.load_default()
 
 
+def _is_braw(video_path: str) -> bool:
+    return Path(video_path).suffix.lower() == ".braw"
+
+
 class FrameExtractor:
     CANVAS_W = 5760
     CANVAS_H = 4320
@@ -99,6 +103,10 @@ class FrameExtractor:
 
     @staticmethod
     def get_framerate(video_path: str) -> Optional[float]:
+        if _is_braw(video_path):
+            from braw_extractor import get_braw_info
+            info = get_braw_info(video_path)
+            return info.get("fps") if info else None
         try:
             r = subprocess.run(
                 [_FFPROBE, "-v", "error", "-select_streams", "v:0",
@@ -119,6 +127,9 @@ class FrameExtractor:
 
     @staticmethod
     def get_duration(video_path: str) -> Optional[float]:
+        if _is_braw(video_path):
+            from braw_extractor import get_braw_duration
+            return get_braw_duration(video_path)
         try:
             r = subprocess.run(
                 [_FFPROBE, "-v", "error",
@@ -135,6 +146,9 @@ class FrameExtractor:
 
     @staticmethod
     def _get_video_info(video_path: str) -> dict:
+        if _is_braw(video_path):
+            from braw_extractor import get_braw_info
+            return get_braw_info(video_path) or {}
         try:
             r = subprocess.run(
                 [_FFPROBE, "-v", "error", "-select_streams", "v:0",
@@ -245,6 +259,13 @@ class FrameExtractor:
         return cells
 
     @staticmethod
+    def _extract_braw_cells(video_path, percentages):
+        """Extract PIL Images from a .braw file via the Blackmagic RAW SDK."""
+        from braw_extractor import extract_frames_braw
+        images, _ = extract_frames_braw(video_path, percentages)
+        return images or []
+
+    @staticmethod
     def _stitch_from_images(cells, video_path, duration, fps, video_info):
         try:
             from PIL import Image as PILImage
@@ -306,7 +327,10 @@ class FrameExtractor:
         info = FrameExtractor._get_video_info(video_path)
         n = FrameExtractor._compute_frame_count(duration)
         percentages = FrameExtractor._compute_percentages(n, offset=pct_offset)
-        cells = FrameExtractor._extract_opencv_cells(video_path, duration, fps, percentages)
+        if _is_braw(video_path):
+            cells = FrameExtractor._extract_braw_cells(video_path, percentages)
+        else:
+            cells = FrameExtractor._extract_opencv_cells(video_path, duration, fps, percentages)
         if not cells:
             return None, None
         annotated = [
