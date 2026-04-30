@@ -19,7 +19,7 @@ from metadata_queue import MetadataQueue
 logger = logging.getLogger(__name__)
 
 
-REQUIRED_FIELDS = ("description", "tags", "primary_subject", "primary_action")
+REQUIRED_FIELDS = ("description", "tags", "shot_size", "footage_type")
 
 
 def _is_complete(metadata: dict) -> bool:
@@ -75,6 +75,7 @@ def process_video(
         return False
 
     metadata.setdefault("tagger_version", tagger_version)
+    metadata.setdefault("tagger_schema", getattr(analyzer, "schema_version", "v2"))
     metadata.setdefault("processed_at", str(int(time.time())))
 
     row_id = queue.enqueue(video_path, metadata, duration_s=duration)

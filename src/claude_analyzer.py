@@ -33,6 +33,7 @@ class ClaudeAnalyzer:
         hardware_id: str,
         max_retries: int = 3,
         description_length: str = "standard",
+        schema_version: str = "v2",
         timeout: int = 60,
     ):
         self.proxy_url = proxy_url.rstrip("/")
@@ -40,6 +41,7 @@ class ClaudeAnalyzer:
         self.hardware_id = hardware_id
         self.max_retries = max_retries
         self.description_length = description_length
+        self.schema_version = schema_version
         self.timeout = timeout
 
     @staticmethod
@@ -71,6 +73,7 @@ class ClaudeAnalyzer:
             "hardware_id": self.hardware_id,
             "image_b64": image_b64,
             "description_length": self.description_length,
+            "schema_version": self.schema_version,
         }
 
         for attempt in range(self.max_retries):

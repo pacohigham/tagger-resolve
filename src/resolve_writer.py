@@ -24,24 +24,43 @@ logger = logging.getLogger(__name__)
 
 DURATION_TOLERANCE_S = 0.5
 
-# Mapping from Tagger metadata keys to Resolve native field names.
-# Lists are joined into comma-separated strings before write.
-NATIVE_FIELD_MAP = {
-    "tags":            "Keywords",
-    "description":     "Description",
-    "scene":           "Scene",
-    "shot_type":       "Shot",
-    "primary_subject": "Comments",
+# v2 schema (general production). Direct one-to-one mappings to Resolve
+# native column fields. Single-value enums per field.
+NATIVE_DIRECT_MAP = {
+    "shot_size":     "Shot",
+    "camera_angle":  "Angle",
+    "footage_type":  "Scene",
 }
 
-# These keys are kept in the third-party namespace -- not visible in
-# the Media Pool UI but readable via GetThirdPartyMetadata().
+# These v2 fields all merge into the Resolve "Keywords" field. Each token
+# auto-creates a sub-bin in Resolve, so combining setting/lighting/subject/
+# audio/free-tags into one comma-separated list maximises Smart Bin coverage.
+KEYWORD_SOURCE_FIELDS = (
+    "setting",            # Interior, Exterior, Vehicle, Studio, Mixed
+    "lighting",           # Day, Night, Golden Hour, ...
+    "subject_category",   # list[Person, Group, Crowd, ...]
+    "audio_character",    # Sync Dialogue, Nat Sound, Music, ...
+    "tags",               # free-form list, 3-8 tokens
+)
+
+# Description gets the action verb-phrase appended for richer text search.
+DESCRIPTION_SOURCE_FIELDS = ("description", "action")
+
+# Third-party namespace fields -- not visible in default UI columns but
+# readable via GetThirdPartyMetadata() and (per BMD docs) Smart-Bin
+# filterable. Includes both v2 enum fields without a native home and our
+# own provenance metadata.
 THIRD_PARTY_KEYS = {
+    "camera_movement",
+    "person_count",
+    "tagger_version",
+    "tagger_schema",
+    "processed_at",
+    # Legacy v1 keys -- preserved so re-tagging an old clip with new schema
+    # doesn't drop pre-existing third-party data on this clip.
     "primary_action",
     "transcript",
-    "tagger_version",
     "confidence",
-    "processed_at",
 }
 
 
@@ -118,29 +137,92 @@ def find_matching_clips(
     return same_duration if same_duration else same_name
 
 
+def _to_token_list(value) -> list[str]:
+    """Coerce a string or list value into a clean list of trimmed tokens."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        # Server normalises some lists to comma-joined strings; split back.
+        items = [s for s in str(value).split(",")]
+    out: list[str] = []
+    for item in items:
+        token = str(item).strip()
+        if token:
+            out.append(token)
+    return out
+
+
+def _build_keywords(metadata: dict) -> str:
+    """Combine setting / lighting / subject_category / audio_character /
+    tags into one comma-separated Keywords string. Each token auto-creates
+    a Resolve keyword sub-bin, so the order is preserved and duplicates are
+    removed case-insensitively.
+    """
+    seen: set[str] = set()
+    tokens: list[str] = []
+    for source in KEYWORD_SOURCE_FIELDS:
+        for token in _to_token_list(metadata.get(source)):
+            key = token.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            tokens.append(token)
+    return ", ".join(tokens)
+
+
+def _build_description(metadata: dict) -> str:
+    """Combine description and action into a single readable line."""
+    desc = str(metadata.get("description") or "").strip()
+    action = str(metadata.get("action") or "").strip()
+    if not action:
+        return desc
+    if not desc:
+        return action
+    if action.lower() in desc.lower():
+        return desc
+    sep = " " if desc.endswith((".", "!", "?")) else ". "
+    return f"{desc}{sep}{action}"
+
+
 def _build_field_payload(metadata: dict) -> tuple[dict, dict]:
-    """Split metadata into native fields and third-party fields.
+    """Split v2 metadata into native fields and third-party fields.
 
     Returns (native_payload, third_party_payload). Native values are
-    coerced to strings; lists become comma-separated.
+    plain strings ready for SetMetadata().
     """
     native: dict[str, str] = {}
-    for key, field_name in NATIVE_FIELD_MAP.items():
+
+    # Direct one-to-one enums
+    for key, field_name in NATIVE_DIRECT_MAP.items():
         value = metadata.get(key)
         if value is None or value == "":
             continue
         if isinstance(value, list):
-            value = ",".join(str(v).strip() for v in value if str(v).strip())
+            value = ", ".join(str(v).strip() for v in value if str(v).strip())
+        value = str(value).strip()
         if value:
-            native[field_name] = str(value)
+            native[field_name] = value
 
+    # Description = description + action (richer text search)
+    desc_combined = _build_description(metadata)
+    if desc_combined:
+        native["Description"] = desc_combined
+
+    # Keywords = combined setting + lighting + subject + audio + tags
+    keywords = _build_keywords(metadata)
+    if keywords:
+        native["Keywords"] = keywords
+
+    # Third-party namespace
     third: dict[str, str] = {}
     for key in THIRD_PARTY_KEYS:
         value = metadata.get(key)
         if value is None or value == "":
             continue
         if isinstance(value, list):
-            value = ",".join(str(v) for v in value)
+            value = ", ".join(str(v) for v in value)
         third[f"Tagger.{key}"] = str(value)
 
     return native, third

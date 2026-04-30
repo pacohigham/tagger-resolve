@@ -83,12 +83,14 @@ class BatchClient:
         license_key: str,
         hardware_id: str,
         description_length: str = "standard",
+        schema_version: str = "v2",
         timeout: int = 60,
     ):
         self.proxy_url = proxy_url.rstrip("/")
         self.license_key = license_key
         self.hardware_id = hardware_id
         self.description_length = description_length
+        self.schema_version = schema_version
         self.timeout = timeout
 
     @staticmethod
@@ -117,6 +119,7 @@ class BatchClient:
             "license_key":        self.license_key or "DEMO-DEMO-DEMO-DEMO",
             "hardware_id":        self.hardware_id,
             "description_length": self.description_length,
+            "schema_version":     self.schema_version,
             "items":              payload_items,
         }
         resp = self._post("/batch/submit", json=body)

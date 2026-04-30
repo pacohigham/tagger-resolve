@@ -201,6 +201,7 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
             continue
         meta = dict(r.metadata)
         meta.setdefault("tagger_version", VERSION)
+        meta.setdefault("tagger_schema", bc.schema_version)
         meta.setdefault("processed_at", str(int(time.time())))
         name, dur, path = by_id[r.custom_id]
         queue.enqueue(path, meta, duration_s=dur)
