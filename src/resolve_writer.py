@@ -137,8 +137,25 @@ def find_matching_clips(
     return same_duration if same_duration else same_name
 
 
+def _scrub_token(s: str) -> str:
+    """Defensive cleanup for a metadata token before it reaches Resolve.
+
+    Replaces hyphens with spaces, collapses whitespace, and trims.
+    The v2 prompt forbids hyphens, but a stray model response should still
+    produce clean Keyword sub-bins.
+    """
+    if not s:
+        return ""
+    cleaned = str(s).replace("-", " ")
+    return " ".join(cleaned.split()).strip()
+
+
 def _to_token_list(value) -> list[str]:
-    """Coerce a string or list value into a clean list of trimmed tokens."""
+    """Coerce a string or list value into a clean list of trimmed tokens.
+
+    Splits comma-joined strings, trims whitespace, replaces hyphens with
+    spaces, drops empties.
+    """
     if value is None or value == "":
         return []
     if isinstance(value, (list, tuple)):
@@ -148,7 +165,7 @@ def _to_token_list(value) -> list[str]:
         items = [s for s in str(value).split(",")]
     out: list[str] = []
     for item in items:
-        token = str(item).strip()
+        token = _scrub_token(item)
         if token:
             out.append(token)
     return out
@@ -194,14 +211,16 @@ def _build_field_payload(metadata: dict) -> tuple[dict, dict]:
     """
     native: dict[str, str] = {}
 
-    # Direct one-to-one enums
+    # Direct one-to-one enums (Shot, Angle, Scene). These are display-facing
+    # column values and must not contain hyphens for clean Smart Bin behaviour.
     for key, field_name in NATIVE_DIRECT_MAP.items():
         value = metadata.get(key)
         if value is None or value == "":
             continue
         if isinstance(value, list):
-            value = ", ".join(str(v).strip() for v in value if str(v).strip())
-        value = str(value).strip()
+            value = ", ".join(_scrub_token(v) for v in value if _scrub_token(v))
+        else:
+            value = _scrub_token(value)
         if value:
             native[field_name] = value
 
@@ -215,14 +234,20 @@ def _build_field_payload(metadata: dict) -> tuple[dict, dict]:
     if keywords:
         native["Keywords"] = keywords
 
-    # Third-party namespace
+    # Third-party namespace. Enum-like fields (camera_movement, person_count)
+    # are scrubbed so a stray hyphen in the model response never lands.
+    # Free-form fields (transcript, processed_at, tagger_version) are passed
+    # through untouched.
     third: dict[str, str] = {}
+    enum_third = {"camera_movement", "person_count"}
     for key in THIRD_PARTY_KEYS:
         value = metadata.get(key)
         if value is None or value == "":
             continue
         if isinstance(value, list):
             value = ", ".join(str(v) for v in value)
+        if key in enum_third:
+            value = _scrub_token(value)
         third[f"Tagger.{key}"] = str(value)
 
     return native, third
