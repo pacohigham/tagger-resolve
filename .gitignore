@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.spec
+.env
+*.log
+*.db
+*.sqlite
+.DS_Store
+config.json
