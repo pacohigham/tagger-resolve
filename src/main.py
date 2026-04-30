@@ -20,10 +20,13 @@ import threading
 import time
 from pathlib import Path
 
+from batch_client import (
+    BatchClient, BatchSubmitError, BatchNotReady, CreditsExhaustedError,
+)
 from claude_analyzer import ClaudeAnalyzer, test_proxy_connection
 from config import Config, db_path, log_path
 from flush_worker import FlushWorker
-from frame_extractor import test_ffmpeg
+from frame_extractor import FrameExtractor, test_ffmpeg
 from metadata_queue import MetadataQueue
 from resolve_connector import describe as describe_resolve
 from video_tagger import process_video
@@ -105,6 +108,111 @@ def cmd_flush_once(queue: MetadataQueue) -> int:
     worker = FlushWorker(queue)
     worker._tick()
     print(worker.status())
+    return 0
+
+
+def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
+    """Process N files via the Batch API.
+
+    Frame extraction stays local. Stitched grids are submitted as a single
+    Anthropic batch (50% cheaper, separate quota). When the batch ends,
+    metadata lands in the local queue and the existing flush worker pushes
+    it into Resolve.
+    """
+    if not paths:
+        print("no files supplied", file=sys.stderr)
+        return 1
+
+    # Stitch each file and collect (queue_row_or_path, b64, name, duration)
+    items: list[tuple[str, str, str, float, str]] = []  # (custom_id, b64, name, dur, path)
+    temp_dirs: list[str] = []
+    print(f"Extracting frames for {len(paths)} files...")
+    for i, path in enumerate(paths, 1):
+        if not Path(path).exists():
+            print(f"  [{i}/{len(paths)}] SKIP (missing): {path}")
+            continue
+        name = Path(path).name
+        duration = FrameExtractor.get_duration(path)
+        if duration is None:
+            print(f"  [{i}/{len(paths)}] SKIP (no duration): {name}")
+            continue
+        stitched, td = FrameExtractor.extract_and_stitch(path)
+        if not stitched:
+            print(f"  [{i}/{len(paths)}] SKIP (stitch failed): {name}")
+            if td:
+                temp_dirs.append(td)
+            continue
+        b64 = BatchClient.encode_image(stitched)
+        custom_id = f"job-{i:04d}"
+        items.append((custom_id, b64, name, duration, path))
+        if td:
+            temp_dirs.append(td)
+        print(f"  [{i}/{len(paths)}] stitched: {name} ({len(b64)//1024} KB)")
+
+    if not items:
+        print("no files to submit", file=sys.stderr)
+        return 1
+
+    # Submit batch
+    bc = BatchClient(
+        proxy_url=cfg.proxy_url,
+        license_key=cfg.license_key,
+        hardware_id=cfg.hardware_id,
+        description_length=cfg.description_length,
+    )
+
+    print(f"\nSubmitting batch of {len(items)} items...")
+    try:
+        sub = bc.submit([(cid, b64, n) for (cid, b64, n, _, _) in items])
+    except CreditsExhaustedError as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 2
+    except BatchSubmitError as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 2
+    print(f"  batch_id={sub.batch_id}")
+    print(f"  pre-deducted={sub.credits_pre_deducted} balance_after={sub.credits_remaining}")
+
+    # Poll
+    print("\nWaiting for results (poll every 10s)...")
+    def progress(st):
+        c = st.counts
+        print(
+            f"  status={st.processing_status} "
+            f"processing={c.get('processing',0)} "
+            f"succeeded={c.get('succeeded',0)} errored={c.get('errored',0)}"
+        )
+
+    try:
+        res = bc.wait_for(sub.batch_id, poll_interval=10.0, progress_cb=progress)
+    except TimeoutError as e:
+        print(f"TIMEOUT: {e}", file=sys.stderr)
+        return 3
+
+    print(f"\nBatch ended: succeeded={res.succeeded} failed={res.failed} "
+          f"refunded={res.credits_refunded} balance={res.credits_remaining}")
+
+    # Map results into the local queue
+    by_id = {(cid): (n, d, p) for (cid, _, n, d, p) in items}
+    enqueued = 0
+    for r in res.results:
+        if r.status != "succeeded" or not r.metadata:
+            print(f"  [{r.custom_id}] {r.status}: {r.error or '(no metadata)'}")
+            continue
+        meta = dict(r.metadata)
+        meta.setdefault("tagger_version", VERSION)
+        meta.setdefault("processed_at", str(int(time.time())))
+        name, dur, path = by_id[r.custom_id]
+        queue.enqueue(path, meta, duration_s=dur)
+        enqueued += 1
+        print(f"  [{r.custom_id}] OK: {name}")
+
+    # Cleanup stitch temp dirs
+    for td in temp_dirs:
+        FrameExtractor.cleanup_frames([], td)
+
+    print(f"\nQueued {enqueued} items for Resolve write.")
+    print("Run --flush-once to push them into the open Resolve project.")
     return 0
 
 
@@ -211,6 +319,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate", action="store_true", help="Run env checks and exit")
     parser.add_argument("--status", action="store_true", help="Print queue counts and exit")
     parser.add_argument("--process", metavar="FILE", help="Process a single file and exit")
+    parser.add_argument("--batch", nargs="+", metavar="FILE",
+                        help="Process N files via the Batch API (cheaper, no rate limits)")
+    parser.add_argument("--batch-from-resolve", action="store_true",
+                        help="Batch-process every clip in the open Resolve project's Media Pool")
     parser.add_argument("--flush-once", action="store_true", help="Run one flush tick and exit")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
@@ -225,6 +337,19 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(queue)
     if args.process:
         return cmd_process_file(cfg, queue, args.process)
+    if args.batch:
+        return cmd_batch(cfg, queue, args.batch)
+    if args.batch_from_resolve:
+        from resolve_connector import get_current_project
+        from resolve_writer import _walk_clips
+        project = get_current_project()
+        if project is None:
+            print("Resolve is not running with an open project.", file=sys.stderr)
+            return 1
+        clips = list(_walk_clips(project.GetMediaPool().GetRootFolder()))
+        paths = [c.GetClipProperty("File Path") for c in clips]
+        paths = [p for p in paths if p]
+        return cmd_batch(cfg, queue, paths)
     if args.flush_once:
         return cmd_flush_once(queue)
     return run_tray(cfg, queue)
