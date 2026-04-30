@@ -33,12 +33,17 @@ NATIVE_DIRECT_MAP = {
 }
 
 # These v2 fields all merge into the Resolve "Keywords" field. Each token
-# auto-creates a sub-bin in Resolve, so combining setting/lighting/subject/
-# audio/free-tags into one comma-separated list maximises Smart Bin coverage.
+# auto-creates a sub-bin in Resolve, so combining all of them into one
+# comma-separated list maximises Smart Bin coverage. Order matters only
+# for de-dup tie-breaking and the Description display order in the
+# inspector; Smart Bins find them regardless.
 KEYWORD_SOURCE_FIELDS = (
     "setting",            # Interior, Exterior, Vehicle, Studio, Mixed
+    "environment",        # Urban, Suburban, Rural, Wilderness, ...
+    "location_type",      # Street, Park, Office, Construction Site, ...
     "lighting",           # Day, Night, Golden Hour, ...
     "subject_category",   # list[Person, Group, Crowd, ...]
+    "shot_composition",   # Single Subject, Two Shot, Group Shot, ...
     "audio_character",    # Sync Dialogue, Nat Sound, Music, ...
     "tags",               # free-form list, 3-8 tokens
 )
