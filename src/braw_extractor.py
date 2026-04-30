@@ -80,7 +80,9 @@ _cf_handle: Optional[ctypes.CDLL] = None
 
 
 def _bind_corefoundation(lib: ctypes.CDLL) -> ctypes.CDLL:
-    """Pick the right binding for CFStringCreateWithCString / CFRelease."""
+    """Pick the right binding for CFStringCreateWithCString / CFRelease /
+    CFStringGetCString (used to read valid attribute lists back to Python).
+    """
     if platform.system() == "Darwin":
         cf = ctypes.CDLL(
             "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
@@ -92,7 +94,21 @@ def _bind_corefoundation(lib: ctypes.CDLL) -> ctypes.CDLL:
     cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
     cf.CFRelease.restype  = None
     cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFStringGetCString.restype  = ctypes.c_bool
+    cf.CFStringGetCString.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32,
+    ]
     return cf
+
+
+def _cfstr_to_py(cf_ref) -> Optional[str]:
+    """Read a CFStringRef back into a Python str. Returns None on failure."""
+    if not cf_ref or _cf_handle is None:
+        return None
+    buf = ctypes.create_string_buffer(512)
+    if _cf_handle.CFStringGetCString(cf_ref, buf, 512, _kCFStringEncodingUTF8):
+        return buf.value.decode("utf-8", errors="replace")
+    return None
 
 
 def _cfstr(s: str) -> ctypes.c_void_p:
@@ -252,6 +268,83 @@ def _attrs_set_clip_attribute(attrs: int, attribute: int, variant: Variant):
                   [ctypes.c_uint32, ctypes.POINTER(Variant)],
                   ctypes.c_uint32(attribute), ctypes.byref(variant))
     return hr == S_OK
+
+
+def _attrs_get_attribute_list_strings(attrs: int, attribute: int) -> list[str]:
+    """Query the list of valid string values for a clip-processing attribute.
+
+    Wraps GetClipAttributeList (vtable slot 6). Two-call protocol:
+    1) ask for count with NULL array
+    2) allocate array of that count
+    3) call again to fill, then read CFStringRef from each Variant.
+
+    Returns [] if the attribute is not a list type or query fails.
+    """
+    count = ctypes.c_uint32(0)
+    is_ro = ctypes.c_bool(False)
+    # 1) get required count
+    hr = _vt_call(attrs, 6, HRESULT,
+                  [ctypes.c_uint32, ctypes.POINTER(Variant),
+                   ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_bool)],
+                  ctypes.c_uint32(attribute), None,
+                  ctypes.byref(count), ctypes.byref(is_ro))
+    if hr != S_OK or count.value == 0:
+        return []
+    # 2) allocate array of Variants and fetch
+    arr = (Variant * count.value)()
+    hr = _vt_call(attrs, 6, HRESULT,
+                  [ctypes.c_uint32, ctypes.POINTER(Variant),
+                   ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_bool)],
+                  ctypes.c_uint32(attribute), arr,
+                  ctypes.byref(count), ctypes.byref(is_ro))
+    if hr != S_OK:
+        return []
+    out: list[str] = []
+    for i in range(count.value):
+        v = arr[i]
+        if v.vt == blackmagicRawVariantTypeString and v._u.bstrVal:
+            s = _cfstr_to_py(v._u.bstrVal)
+            if s:
+                out.append(s)
+    return out
+
+
+# Display-friendly gamma values in priority order. The SDK accepts only
+# values that the source codec advertises via GetClipAttributeList; we
+# pick the first match from this list. "Blackmagic Design Video" is the
+# closest equivalent to a Rec.709 display gamma curve.
+_PREFERRED_GAMMA_ORDER = (
+    "Blackmagic Design Video",
+    "Rec. 709",
+    "Rec.709",
+    "Rec709",
+)
+
+# Display-friendly gamut values in priority order. SDK uses "Blackmagic
+# Design" (no "Wide Gamut" suffix). We try Rec.709 spellings first since
+# that is the closest match to display target, then fall through to the
+# camera-native "Blackmagic Design" gamut which always works.
+_PREFERRED_GAMUT_ORDER = (
+    "Rec. 709",
+    "Rec.709",
+    "Rec709",
+    "BT.709",
+    "Rec. 2020",
+    "BT.2020",
+    "Blackmagic Design",
+)
+
+
+def _pick_first(supported: list[str], preferences: tuple[str, ...]) -> Optional[str]:
+    """Return the first preference present in supported, case-insensitive."""
+    if not supported:
+        return None
+    norm = {s.strip().lower(): s for s in supported}
+    for pref in preferences:
+        match = norm.get(pref.strip().lower())
+        if match:
+            return match
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +641,51 @@ def is_braw_available() -> bool:
     return _load_sdk()
 
 
+def _apply_display_color_space(attrs: int, clip_label: str) -> None:
+    """Set gamma + gamut to the best display-target match the clip supports.
+
+    BRAW source files come in many camera spaces (Blackmagic Design Film,
+    Wide Gamut, etc). The SDK only accepts target gamma/gamut values that
+    the codec advertises for this clip. We query GetClipAttributeList for
+    each, pick the closest display-friendly match from a priority list,
+    and fall back to whatever the SDK already had set if no preferred
+    value is offered (the cloned attrs default to a sensible camera native).
+    """
+    # Gamma
+    supported_gamma = _attrs_get_attribute_list_strings(
+        attrs, blackmagicRawClipProcessingAttributeGamma
+    )
+    chosen_gamma = _pick_first(supported_gamma, _PREFERRED_GAMMA_ORDER)
+    if chosen_gamma:
+        v = _string_variant(chosen_gamma)
+        if _attrs_set_clip_attribute(attrs, blackmagicRawClipProcessingAttributeGamma, v):
+            logger.info(f"BRAW {clip_label}: gamma -> {chosen_gamma}")
+        else:
+            logger.warning(f"BRAW {clip_label}: SDK rejected gamma {chosen_gamma!r}")
+    elif supported_gamma:
+        logger.info(
+            f"BRAW {clip_label}: keeping native gamma "
+            f"(SDK offers {supported_gamma}, none preferred)"
+        )
+
+    # Gamut
+    supported_gamut = _attrs_get_attribute_list_strings(
+        attrs, blackmagicRawClipProcessingAttributeGamut
+    )
+    chosen_gamut = _pick_first(supported_gamut, _PREFERRED_GAMUT_ORDER)
+    if chosen_gamut:
+        v = _string_variant(chosen_gamut)
+        if _attrs_set_clip_attribute(attrs, blackmagicRawClipProcessingAttributeGamut, v):
+            logger.info(f"BRAW {clip_label}: gamut -> {chosen_gamut}")
+        else:
+            logger.warning(f"BRAW {clip_label}: SDK rejected gamut {chosen_gamut!r}")
+    elif supported_gamut:
+        logger.info(
+            f"BRAW {clip_label}: keeping native gamut "
+            f"(SDK offers {supported_gamut}, none preferred)"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -590,12 +728,7 @@ def extract_frames_braw(
         )
 
         attrs = _clip_clone_clip_processing_attrs(clip)
-        gamma_v = _string_variant(_TARGET_GAMMA)
-        gamut_v = _string_variant(_TARGET_GAMUT)
-        if not _attrs_set_clip_attribute(attrs, blackmagicRawClipProcessingAttributeGamma, gamma_v):
-            logger.warning("BRAW: gamma attribute not set; output may be log-encoded")
-        if not _attrs_set_clip_attribute(attrs, blackmagicRawClipProcessingAttributeGamut, gamut_v):
-            logger.warning("BRAW: gamut attribute not set; output may be log-encoded")
+        _apply_display_color_space(attrs, Path(video_path).name)
 
         cb = _BrawCallbackCOM(attrs)
         _codec_set_callback(codec, cb.as_ptr())
