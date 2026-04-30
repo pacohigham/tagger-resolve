@@ -260,6 +260,22 @@ def _clip_create_job_read_frame(clip: int, frame_index: int) -> int:
     return out.value
 
 
+def _clip_get_camera_type(clip: int) -> Optional[str]:
+    """Read the camera type string for the clip (e.g. 'URSA Mini Pro 12K').
+
+    Wraps IBlackmagicRawClip::GetCameraType (vtable slot 11). Returns None
+    if the SDK fails to provide a value.
+    """
+    out = ctypes.c_void_p(0)
+    hr = _vt_call(clip, 11, HRESULT, [ctypes.POINTER(ctypes.c_void_p)], ctypes.byref(out))
+    if hr != S_OK or not out.value:
+        return None
+    s = _cfstr_to_py(out.value)
+    if _cf_handle is not None and out.value:
+        _cf_handle.CFRelease(out.value)
+    return s
+
+
 # ---------------------------------------------------------------------------
 # IBlackmagicRawClipProcessingAttributes wrappers
 # ---------------------------------------------------------------------------
@@ -793,11 +809,13 @@ def get_braw_duration(video_path: str) -> Optional[float]:
 
 
 def get_braw_info(video_path: str) -> dict:
-    """Return {codec, width, height, fps} for a .braw file. Empty dict on failure.
+    """Return {codec, width, height, fps, camera_make, camera_model} for a .braw.
 
     Width/height come from a single decoded frame at quarter resolution; we
     multiply by 4 to recover the source resolution. (BRAW does not expose
-    a direct "source resolution" property in the SDK.)
+    a direct source-resolution property in the SDK.) BRAW is BMD-exclusive
+    so camera_make is always 'Blackmagic'; camera_model comes from the SDK
+    via IBlackmagicRawClip::GetCameraType.
     """
     if not _load_sdk():
         return {}
@@ -808,6 +826,7 @@ def get_braw_info(video_path: str) -> dict:
         codec = _factory_create_codec(_factory_ptr)
         clip  = _codec_open_clip(codec, video_path)
         fps   = _clip_get_frame_rate(clip)
+        camera_model = _clip_get_camera_type(clip)
         attrs = _clip_clone_clip_processing_attrs(clip)
         cb    = _BrawCallbackCOM(attrs)
         _codec_set_callback(codec, cb.as_ptr())
@@ -817,15 +836,26 @@ def get_braw_info(video_path: str) -> dict:
         _job_submit(job)
         _codec_flush_jobs(codec)
         img = cb.wait_for_frame(0, timeout=10.0)
-        if img is None:
-            return {"codec": "BRAW", "width": 0, "height": 0, "fps": fps}
-        # Quarter resolution -> multiply by 4 to recover source dims
-        return {
-            "codec":  "BRAW",
-            "width":  img.width * 4,
-            "height": img.height * 4,
-            "fps":    fps,
+        # Strip redundant 'Blackmagic ' prefix from model since make is
+        # captured separately. e.g. 'Blackmagic Pocket Cinema Camera 4K'
+        # -> 'Pocket Cinema Camera 4K' for cleaner Resolve bin labels.
+        cleaned_model = camera_model
+        if cleaned_model and cleaned_model.lower().startswith("blackmagic "):
+            cleaned_model = cleaned_model[len("blackmagic "):].lstrip()
+        info = {
+            "codec":        "BRAW",
+            "fps":          fps,
+            "camera_make":  "Blackmagic",
+            "camera_model": cleaned_model or "Unknown",
         }
+        if img is None:
+            info["width"]  = 0
+            info["height"] = 0
+        else:
+            # Quarter resolution -> multiply by 4 to recover source dims
+            info["width"]  = img.width * 4
+            info["height"] = img.height * 4
+        return info
     except Exception as e:
         logger.error(f"BRAW info failed for {video_path}: {e}")
         return {}

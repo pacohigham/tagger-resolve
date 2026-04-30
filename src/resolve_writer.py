@@ -45,6 +45,9 @@ KEYWORD_SOURCE_FIELDS = (
     "subject_category",   # list[Person, Group, Crowd, ...]
     "shot_composition",   # Single Subject, Two Shot, Group Shot, ...
     "audio_character",    # Sync Dialogue, Nat Sound, Music, ...
+    "camera_make",        # Blackmagic, ARRI, Sony, DJI, ... (file-derived)
+    "camera_model",       # URSA Mini Pro 12K, Alexa Mini LF, ... (file-derived)
+    "color_space",        # Sony S-Log3, ARRI LogC4, ... (file-derived, optional)
     "tags",               # free-form list, 3-8 tokens
 )
 

@@ -126,23 +126,290 @@ _LOG_TAG_HINTS = (
 )
 
 
-def _detect_log_color_space(stream_info: dict) -> Optional[str]:
+def _detect_log_color_space(stream_info: dict, filename: str = "") -> Optional[str]:
     """Return a friendly label for the source color space if log/HDR detected.
 
-    Reads color_transfer first (most reliable), falls back to scanning
-    tag strings for camera-vendor log markers. Returns None for plain
-    Rec.709 / sRGB / unmarked footage.
+    Detection priority:
+      1. color_transfer field (most reliable)
+      2. stream tag strings for camera-vendor log markers
+      3. filename hints (last resort -- some cameras tag color incorrectly,
+         e.g. Sony FX30 mp4 marks itself bt709 even when shooting S-Log3)
+
+    Returns None for plain Rec.709 / sRGB / unmarked footage.
     """
     transfer = (stream_info.get("color_transfer") or "").lower()
     if transfer and transfer in _LOG_TRANSFER_TAGS:
         return _LOG_TRANSFER_TAGS[transfer]
 
     tags = stream_info.get("tags") or {}
-    haystack = " ".join(str(v).lower() for v in tags.values())
+    tag_haystack = " ".join(str(v).lower() for v in tags.values())
     for hint, label in _LOG_TAG_HINTS:
-        if hint in haystack:
+        if hint in tag_haystack:
             return label
+
+    # Filename fallback for cameras that strip or mistag color metadata
+    if filename:
+        fn = filename.lower().replace("_", " ").replace("-", " ")
+        for hint, label in _LOG_TAG_HINTS:
+            if hint in fn:
+                return label
     return None
+
+
+# Brand-name normalization. Container tags are inconsistent ("Sony" vs
+# "SONY" vs "Sony Corporation" vs "Sony Imaging"); fold to canonical names
+# so the Resolve Keyword bin gets a single sub-bin per manufacturer.
+_BRAND_CANONICAL = {
+    "blackmagic":          "Blackmagic",
+    "blackmagic design":   "Blackmagic",
+    "bmd":                 "Blackmagic",
+    "arri":                "ARRI",
+    "arnold & richter":    "ARRI",
+    "sony":                "Sony",
+    "canon":               "Canon",
+    "panasonic":           "Panasonic",
+    "nikon":               "Nikon",
+    "apple":               "Apple",
+    "apple inc":           "Apple",
+    "apple computer":      "Apple",
+    "dji":                 "DJI",
+    "sz dji":              "DJI",
+    "gopro":               "GoPro",
+    "red":                 "RED",
+    "red digital cinema":  "RED",
+    "fujifilm":            "Fujifilm",
+    "leica":               "Leica",
+    "samsung":             "Samsung",
+    "google":              "Google",
+}
+
+# Compressor / encoder strings that strongly imply a manufacturer when
+# the make tag is missing. Matched substring, case-insensitive.
+_BRAND_HINTS_BY_TAG = (
+    ("blackmagic",       "Blackmagic"),
+    ("apple prores",     "Apple"),
+    ("apple log",        "Apple"),
+    ("xavc",             "Sony"),
+    ("xdcam",            "Sony"),
+    ("s-log",            "Sony"),
+    ("logc",             "ARRI"),
+    ("alexa",            "ARRI"),
+    ("arriraw",          "ARRI"),
+    ("v-log",            "Panasonic"),
+    ("vlog",             "Panasonic"),
+    ("n-log",            "Nikon"),
+    ("clog",             "Canon"),
+    ("canon log",        "Canon"),
+    ("dji",              "DJI"),
+    ("gopro",            "GoPro"),
+    ("redcode",          "RED"),
+)
+
+
+# Filename-based fallback. Many cameras (especially Sony's pro-consumer
+# bodies) strip ALL camera metadata from the H.264/H.265 export, so the
+# only signal we have is the filename. Editors often name files with the
+# camera body / picture profile in the filename intentionally for this
+# reason. Order matters: longer/more-specific tokens first.
+_FILENAME_MODEL_HINTS = (
+    # Sony bodies
+    ("fx30",   "Sony", "FX30"),
+    ("fx3",    "Sony", "FX3"),
+    ("fx6",    "Sony", "FX6"),
+    ("fx9",    "Sony", "FX9"),
+    ("a7s",    "Sony", "A7S"),
+    ("a7iv",   "Sony", "A7 IV"),
+    ("a7iii",  "Sony", "A7 III"),
+    ("a7riv",  "Sony", "A7R IV"),
+    ("venice", "Sony", "Venice"),
+    # ARRI
+    ("alexa35",     "ARRI", "ALEXA 35"),
+    ("alexa-mini",  "ARRI", "ALEXA Mini"),
+    ("alexa",       "ARRI", "ALEXA"),
+    ("amira",       "ARRI", "AMIRA"),
+    # Blackmagic
+    ("ursa",        "Blackmagic", "URSA"),
+    ("bmpcc",       "Blackmagic", "Pocket Cinema Camera"),
+    ("pocket",      "Blackmagic", "Pocket Cinema Camera"),
+    # Canon
+    ("c70",   "Canon", "EOS C70"),
+    ("c300",  "Canon", "EOS C300"),
+    ("c500",  "Canon", "EOS C500"),
+    ("r5c",   "Canon", "EOS R5 C"),
+    ("r5",    "Canon", "EOS R5"),
+    # Panasonic
+    ("gh6",   "Panasonic", "GH6"),
+    ("gh5",   "Panasonic", "GH5"),
+    ("s1h",   "Panasonic", "S1H"),
+    # DJI
+    ("mavic",   "DJI", "Mavic"),
+    ("inspire", "DJI", "Inspire"),
+    ("ronin",   "DJI", "Ronin"),
+    # GoPro
+    ("hero",  "GoPro", "Hero"),
+    # RED
+    ("v-raptor", "RED", "V-Raptor"),
+    ("komodo",   "RED", "Komodo"),
+)
+
+
+def _detect_from_filename(filename: str) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort camera (make, model) inferred from the filename.
+
+    Used when container metadata is missing -- common on Sony bodies that
+    strip make/model from H.264/H.265 exports. Filenames frequently
+    encode the camera body and picture profile by convention.
+    """
+    if not filename:
+        return None, None
+    norm = filename.lower().replace("_", " ").replace("-", " ")
+    for token, brand, model in _FILENAME_MODEL_HINTS:
+        if token in norm:
+            return brand, model
+    return None, None
+
+
+def _normalize_make(raw: Optional[str]) -> Optional[str]:
+    """Map a raw 'make' tag to a canonical brand name. None on no match."""
+    if not raw:
+        return None
+    norm = str(raw).strip().lower()
+    if not norm:
+        return None
+    if norm in _BRAND_CANONICAL:
+        return _BRAND_CANONICAL[norm]
+    # Partial-prefix match for verbose vendor strings
+    for key, canonical in _BRAND_CANONICAL.items():
+        if norm.startswith(key) or key in norm:
+            return canonical
+    return None
+
+
+def _clean_model(raw: Optional[str], make: Optional[str] = None) -> Optional[str]:
+    """Light cleanup of camera model string. None on empty.
+
+    Collapses multiple whitespace and strips a redundant leading brand
+    prefix when it matches the detected make (so we get 'AMIRA' not
+    'ARRI AMIRA' and 'Pocket Cinema Camera 4K' not 'Blackmagic Pocket
+    Cinema Camera 4K' -- the brand is captured separately on camera_make
+    and the editor sees both sub-bins in Resolve's Keyword tree).
+    """
+    if not raw:
+        return None
+    s = " ".join(str(raw).split())  # collapse whitespace
+    if make:
+        prefix = make.lower()
+        if s.lower().startswith(prefix + " "):
+            s = s[len(prefix) + 1:].lstrip()
+    return s or None
+
+
+def _detect_camera_metadata(format_info: dict, stream_info: dict, filename: str = "") -> dict:
+    """Extract {camera_make, camera_model} from ffprobe output.
+
+    Detection priority (high -> low confidence):
+      1. Vendor-specific tags from cameras that embed full metadata:
+         - ARRI .mov: com.arri.camera.CameraModel
+         - ARRI .mxf descriptor: company_name + product_name
+         - Sony, Canon, Panasonic equivalents
+      2. Standard make/model tags (most camera apps + iPhones):
+         - format.tags.make + .model
+         - com.apple.quicktime.make + .model
+      3. Compressor / encoder substring scan (last resort)
+
+    Apple's QuickTime container often shows vendor_id='appl' or encoder
+    'Apple ProRes' even on ARRI footage, so those are explicitly NOT
+    treated as a Make signal. Only matches as last resort if nothing
+    else fires.
+
+    Either field returns 'Unknown' when undetectable.
+    """
+    fmt_tags = (format_info.get("tags") or {})
+    str_tags = (stream_info.get("tags") or {})
+    all_tags = {**str_tags, **fmt_tags}    # fmt_tags wins on conflict
+
+    make: Optional[str] = None
+    model: Optional[str] = None
+
+    # --- Tier 1: vendor-specific camera-metadata atoms -----------------------
+
+    # ARRI .mov files (CameraModel, CameraIndex, etc as com.arri.camera.* keys)
+    arri_model = all_tags.get("com.arri.camera.CameraModel")
+    if arri_model:
+        make = "ARRI"
+        model = _clean_model(arri_model, make=make)
+
+    # ARRI .mxf descriptor: company_name + product_name
+    if not make:
+        company = all_tags.get("company_name")
+        product = all_tags.get("product_name")
+        if company:
+            normalised = _normalize_make(company)
+            if normalised:
+                make = normalised
+                if product:
+                    model = _clean_model(product, make=make)
+
+    # Sony XAVC: vendor-specific atoms vary; rarely useful
+    # Canon EOS atoms: com.canon.* (some models)
+    # iPhone / Apple Camera: com.apple.quicktime.{make,model} -- handled in tier 2
+
+    # --- Tier 2: standard make/model tags ------------------------------------
+
+    if not make:
+        for k in ("make", "manufacturer", "MAKE",
+                 "com.apple.quicktime.make"):
+            v = all_tags.get(k)
+            if v:
+                normalised = _normalize_make(v)
+                if normalised:
+                    make = normalised
+                    break
+
+    if not model:
+        for k in ("model", "MODEL", "camera_model",
+                 "com.apple.quicktime.model"):
+            v = all_tags.get(k)
+            if v:
+                model = _clean_model(v, make=make)
+                if model:
+                    break
+
+    # --- Tier 3: compressor/encoder substring scan (lowest confidence) ------
+    #
+    # Skip this when we already have a make. Note: Apple ProRes / vendor_id=appl
+    # is never a reliable signal for make -- ARRI cameras export ProRes via
+    # Apple's encoder, so the container shows Apple even though the camera
+    # was an ALEXA. Brand hints here only help when no other signal exists
+    # AND the hint isn't a generic codec name.
+    if not make:
+        haystack_parts = []
+        for k in ("compressor_name", "encoder", "comment", "handler_name"):
+            v = all_tags.get(k)
+            if v:
+                haystack_parts.append(str(v).lower())
+        haystack = " ".join(haystack_parts)
+        if haystack:
+            for hint, brand in _BRAND_HINTS_BY_TAG:
+                if hint in haystack:
+                    make = brand
+                    break
+
+    # --- Tier 4: filename heuristics ----------------------------------------
+    # Last-resort signal when the camera stripped its metadata (common on
+    # Sony pro-consumer mp4 exports). Editors frequently encode the body
+    # in the filename intentionally.
+    if not make or not model:
+        fn_make, fn_model = _detect_from_filename(filename)
+        if not make and fn_make:
+            make = fn_make
+        if not model and fn_model:
+            model = fn_model
+
+    return {
+        "camera_make":  make or "Unknown",
+        "camera_model": model or "Unknown",
+    }
 
 
 class FrameExtractor:
@@ -202,23 +469,32 @@ class FrameExtractor:
             return get_braw_info(video_path) or {}
         try:
             r = subprocess.run(
-                [_FFPROBE, "-v", "error", "-select_streams", "v:0",
+                [_FFPROBE, "-v", "error",
+                 "-select_streams", "v:0",
                  "-show_entries",
-                 "stream=codec_name,width,height,color_space,color_transfer,color_primaries:stream_tags",
+                 "stream=codec_name,width,height,color_space,color_transfer,color_primaries:"
+                 "stream_tags:format_tags",
+                 "-show_format",
                  "-of", "json", video_path],
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode != 0:
                 return {}
-            streams = json.loads(r.stdout).get("streams", [])
+            parsed = json.loads(r.stdout)
+            streams = parsed.get("streams", [])
             s = streams[0] if streams else {}
-            color_label = _detect_log_color_space(s)
+            f = parsed.get("format", {}) or {}
+            fn = Path(video_path).name
+            color_label = _detect_log_color_space(s, filename=fn)
+            cam = _detect_camera_metadata(f, s, filename=fn)
             info = {
                 "codec":         s.get("codec_name", "unknown"),
                 "width":         s.get("width", 0),
                 "height":        s.get("height", 0),
                 "color_space":   s.get("color_space"),
                 "color_transfer":s.get("color_transfer"),
+                "camera_make":   cam["camera_make"],
+                "camera_model":  cam["camera_model"],
             }
             if color_label:
                 info["color_label"] = color_label

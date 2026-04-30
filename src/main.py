@@ -128,8 +128,9 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
         print("no files supplied", file=sys.stderr)
         return 1
 
-    # Stitch each file and collect (queue_row_or_path, b64, name, duration)
-    items: list[tuple[str, str, str, float, str]] = []  # (custom_id, b64, name, dur, path)
+    # Stitch each file and collect tuple per item:
+    #   (custom_id, b64, name, duration, path, video_info)
+    items: list[tuple[str, str, str, float, str, dict]] = []
     temp_dirs: list[str] = []
     print(f"Extracting frames for {len(paths)} files...")
     for i, path in enumerate(paths, 1):
@@ -148,11 +149,13 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
                 temp_dirs.append(td)
             continue
         b64 = BatchClient.encode_image(stitched)
+        info = FrameExtractor._get_video_info(path) or {}
         custom_id = f"job-{i:04d}"
-        items.append((custom_id, b64, name, duration, path))
+        items.append((custom_id, b64, name, duration, path, info))
         if td:
             temp_dirs.append(td)
-        print(f"  [{i}/{len(paths)}] stitched: {name} ({len(b64)//1024} KB)")
+        cam = f"{info.get('camera_make','?')} / {info.get('camera_model','?')}"
+        print(f"  [{i}/{len(paths)}] stitched: {name} ({len(b64)//1024} KB)  cam={cam}")
 
     if not items:
         print("no files to submit", file=sys.stderr)
@@ -168,7 +171,7 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
 
     print(f"\nSubmitting batch of {len(items)} items...")
     try:
-        sub = bc.submit([(cid, b64, n) for (cid, b64, n, _, _) in items])
+        sub = bc.submit([(cid, b64, n) for (cid, b64, n, _, _, _) in items])
     except CreditsExhaustedError as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 2
@@ -197,8 +200,10 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
     print(f"\nBatch ended: succeeded={res.succeeded} failed={res.failed} "
           f"refunded={res.credits_refunded} balance={res.credits_remaining}")
 
-    # Map results into the local queue
-    by_id = {(cid): (n, d, p) for (cid, _, n, d, p) in items}
+    # Map results into the local queue, merging file-derived technical
+    # metadata (camera_make / camera_model / color_space) so editors can
+    # filter by camera in Resolve Smart Bins.
+    by_id = {cid: (n, d, p, info) for (cid, _, n, d, p, info) in items}
     enqueued = 0
     for r in res.results:
         if r.status != "succeeded" or not r.metadata:
@@ -208,7 +213,13 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
         meta.setdefault("tagger_version", VERSION)
         meta.setdefault("tagger_schema", bc.schema_version)
         meta.setdefault("processed_at", str(int(time.time())))
-        name, dur, path = by_id[r.custom_id]
+        name, dur, path, info = by_id[r.custom_id]
+        if info.get("camera_make"):
+            meta["camera_make"] = info["camera_make"]
+        if info.get("camera_model"):
+            meta["camera_model"] = info["camera_model"]
+        if info.get("color_label"):
+            meta["color_space"] = info["color_label"]
         queue.enqueue(path, meta, duration_s=dur)
         enqueued += 1
         print(f"  [{r.custom_id}] OK: {name}")

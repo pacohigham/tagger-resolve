@@ -78,6 +78,16 @@ def process_video(
     metadata.setdefault("tagger_schema", getattr(analyzer, "schema_version", "v2"))
     metadata.setdefault("processed_at", str(int(time.time())))
 
+    # Merge technical metadata (file-derived, not AI-derived) so editors
+    # can filter by camera_make / camera_model in Resolve Smart Bins.
+    info = FrameExtractor._get_video_info(video_path) or {}
+    if info.get("camera_make"):
+        metadata["camera_make"] = info["camera_make"]
+    if info.get("camera_model"):
+        metadata["camera_model"] = info["camera_model"]
+    if info.get("color_label"):
+        metadata["color_space"] = info["color_label"]
+
     row_id = queue.enqueue(video_path, metadata, duration_s=duration)
     logger.info(f"{name}: queued as row {row_id}")
     return True
