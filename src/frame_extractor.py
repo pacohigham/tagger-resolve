@@ -276,10 +276,12 @@ class FrameExtractor:
         temp_dir = tempfile.mkdtemp(prefix="stitch_")
         out_path = os.path.join(temp_dir, "grid.jpg")
 
-        _MAX_BYTES = 4_800_000
+        # Anthropic enforces a 5 MB limit on the base64-encoded image. Base64
+        # inflates by ~33%, so the JPEG must stay below ~3.6 MB to fit safely.
+        _MAX_BYTES = 3_600_000
         quality = 85
         canvas.save(out_path, "JPEG", quality=quality)
-        while os.path.getsize(out_path) > _MAX_BYTES and quality > 50:
+        while os.path.getsize(out_path) > _MAX_BYTES and quality > 40:
             quality -= 5
             canvas.save(out_path, "JPEG", quality=quality)
 
