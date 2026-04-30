@@ -27,7 +27,7 @@ DURATION_TOLERANCE_S = 0.5
 # Mapping from Tagger metadata keys to Resolve native field names.
 # Lists are joined into comma-separated strings before write.
 NATIVE_FIELD_MAP = {
-    "tags":            "Keyword",
+    "tags":            "Keywords",
     "description":     "Description",
     "scene":           "Scene",
     "shot_type":       "Shot",
@@ -154,13 +154,20 @@ def write_metadata_to_clip(clip, metadata: dict) -> tuple[bool, str]:
 
     errors: list[str] = []
 
-    if native:
+    # Per-field writes: dict mode is all-or-nothing across Resolve versions,
+    # so a single unknown field name invalidates the whole batch. Writing one
+    # field at a time gives partial success and a clear log of which fields
+    # this Resolve version recognises.
+    written_fields: list[str] = []
+    for name, value in native.items():
         try:
-            ok = clip.SetMetadata(native)
-            if not ok:
-                errors.append(f"SetMetadata returned False for {list(native)}")
+            ok = clip.SetMetadata(name, value)
+            if ok:
+                written_fields.append(name)
+            else:
+                errors.append(f"SetMetadata({name!r}) returned False")
         except Exception as e:
-            errors.append(f"SetMetadata raised {e!r}")
+            errors.append(f"SetMetadata({name!r}) raised {e!r}")
 
     if third and hasattr(clip, "SetThirdPartyMetadata"):
         try:
@@ -170,9 +177,14 @@ def write_metadata_to_clip(clip, metadata: dict) -> tuple[bool, str]:
         except Exception as e:
             errors.append(f"SetThirdPartyMetadata raised {e!r}")
 
-    if errors:
+    if not written_fields and errors:
         return False, "; ".join(errors)
-    return True, f"native={list(native)} thirdparty={list(third)}"
+    msg = f"wrote {written_fields}"
+    if third:
+        msg += f" + thirdparty={list(third)}"
+    if errors:
+        msg += f" (warnings: {'; '.join(errors)})"
+    return True, msg
 
 
 def write_for_queue_row(row: dict) -> tuple[bool, str, int]:
