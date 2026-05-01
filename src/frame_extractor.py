@@ -94,6 +94,53 @@ def _is_braw(video_path: str) -> bool:
     return Path(video_path).suffix.lower() == ".braw"
 
 
+# Substrings in ffmpeg stderr that indicate the input contains a codec
+# the local ffmpeg cannot decode. These are vendor-locked formats (ARRIRAW,
+# REDCODE, etc) that require their respective paid SDKs. We probe once
+# per file and log a friendly message instead of hammering with N calls.
+_VENDOR_LOCKED_SIGNATURES = (
+    "could not resolve file descriptor strong ref",   # ARRIRAW in MXF
+    "no decoder found for: none",                     # ARRIRAW (paired with above)
+    "Could not find codec parameters for stream",     # generic missing decoder
+)
+
+
+def _ffmpeg_can_decode(video_path: str) -> bool:
+    """Probe whether ffmpeg has any decoder for this file's video stream.
+
+    Runs a no-op transcode of one packet to /dev/null. Returns False (and
+    logs once at info level) if the probe hits a known vendor-lock signal.
+    """
+    try:
+        r = subprocess.run(
+            [
+                _FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", video_path,
+                "-map", "0:v:0",
+                "-frames:v", "1",
+                "-f", "null", os.devnull,
+            ],
+            capture_output=True, timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        return True   # don't block on a slow file; let the real extractor try
+    except Exception:
+        return True
+    if r.returncode == 0:
+        return True
+    err = r.stderr.decode(errors="replace")
+    for sig in _VENDOR_LOCKED_SIGNATURES:
+        if sig in err:
+            logger.info(
+                f"{Path(video_path).name}: vendor-locked codec detected "
+                f"(ARRIRAW / REDCODE / similar). ffmpeg cannot decode. "
+                f"Skipping; native support requires the camera vendor's SDK."
+            )
+            return False
+    # Unknown error -- let the per-frame extractor retry and surface it
+    return True
+
+
 # ffprobe color_transfer values that indicate log encoding (footage will
 # look flat / desaturated by design and Claude should not be told the
 # scene is dim or gloomy on that basis).
@@ -575,28 +622,88 @@ class FrameExtractor:
         return img
 
     @staticmethod
-    def _extract_opencv_cells(video_path, duration, fps, percentages):
+    def _extract_ffmpeg_cells(video_path, duration, fps, percentages):
+        """Extract frames at given video percentages using system ffmpeg.
+
+        Replaces the previous OpenCV-based implementation. System ffmpeg
+        has substantially broader codec support than OpenCV's bundled
+        ffmpeg -- it handles ProRes/MXF, DNxHR variants, certain HEVC
+        profiles, and many ARRI/Sony/Panasonic wrappers that OpenCV
+        cannot decode. (BRAW and ARRIRAW still require their respective
+        vendor SDKs; see the project notes for the pro-codec roadmap.)
+
+        Each frame is extracted in its own subprocess with `-ss BEFORE -i`
+        for fast keyframe seek (sufficient for our "approximately at this
+        percentage" use case -- we are not doing frame-accurate cuts).
+        Workers run in parallel with a small thread pool to amortize the
+        ffmpeg startup overhead across the N target frames.
+        """
         try:
-            import cv2
             from PIL import Image as PILImage
         except ImportError as e:
-            logger.error(f"opencv-python and Pillow required: {e}")
+            logger.error(f"Pillow required: {e}")
             return []
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            logger.error(f"OpenCV could not open: {video_path}")
+        import concurrent.futures
+
+        timestamps = [duration * pct for pct in percentages]
+
+        def _extract_one(ts: float):
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
+                out_path = tf.name
+            # The colorspace filter forces a bt709 interpretation on input
+            # AND output, which lets ffmpeg's swscaler handle ARRI ProRes
+            # files whose color metadata reads as "csp:gbr / prim:reserved
+            # / trc:reserved" -- without this filter, swscale rejects the
+            # 10-bit yuv422p source with "Operation not supported".
+            # `-map 0:v:0` selects only the first video stream so we don't
+            # trip on data tracks (timecode, ARRI metadata) that some MXF
+            # / MOV files include as separate streams with no decoder.
+            try:
+                r = subprocess.run(
+                    [
+                        _FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", f"{ts:.3f}",
+                        "-i", video_path,
+                        "-map", "0:v:0",
+                        "-frames:v", "1",
+                        "-q:v", "5",
+                        "-vf", "colorspace=all=bt709:iall=bt709:format=yuv420p",
+                        out_path,
+                    ],
+                    capture_output=True, timeout=60,
+                )
+                if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                    err = r.stderr.decode(errors="replace")[-400:]
+                    logger.warning(f"ffmpeg frame at t={ts:.2f}s failed: {err}")
+                    return None
+                with PILImage.open(out_path) as im:
+                    return im.convert("RGB").copy()
+            except subprocess.TimeoutExpired:
+                logger.warning(f"ffmpeg frame at t={ts:.2f}s timed out")
+                return None
+            finally:
+                try:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                except OSError:
+                    pass
+
+        # Pre-flight probe: try a single frame at the first timestamp. If
+        # it fails with "no decoder found" / "could not resolve file
+        # descriptor strong ref" the codec is vendor-locked (ARRIRAW,
+        # REDCODE, etc) and there is no point hammering ffmpeg N more
+        # times. Log one clear message and bail.
+        if not _ffmpeg_can_decode(video_path):
             return []
-        cells = []
-        try:
-            for pct in percentages:
-                cap.set(cv2.CAP_PROP_POS_MSEC, duration * pct * 1000)
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                cells.append(PILImage.fromarray(rgb))
-        finally:
-            cap.release()
+
+        cells: list = []
+        # Parallel ffmpeg processes, capped to keep memory reasonable on
+        # large files. ThreadPoolExecutor.map preserves the input order
+        # so frames come back chronologically.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            for img in ex.map(_extract_one, timestamps):
+                if img is not None:
+                    cells.append(img)
         return cells
 
     @staticmethod
@@ -671,7 +778,7 @@ class FrameExtractor:
         if _is_braw(video_path):
             cells = FrameExtractor._extract_braw_cells(video_path, percentages)
         else:
-            cells = FrameExtractor._extract_opencv_cells(video_path, duration, fps, percentages)
+            cells = FrameExtractor._extract_ffmpeg_cells(video_path, duration, fps, percentages)
         if not cells:
             return None, None
         annotated = [
