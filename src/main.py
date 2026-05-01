@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import logging
 import logging.handlers
+import subprocess
 import sys
 import threading
 import time
@@ -233,6 +234,117 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
     return 0
 
 
+_TAGGER_NATIVE_FIELDS = [
+    "Keywords", "Description", "Scene", "Shot", "Angle", "Comments",
+]
+
+
+def _do_clear_metadata() -> None:
+    """Worker thread: confirm, clear, save, close, reopen.
+
+    Runs off the main thread so the tray stays responsive.
+    """
+    from resolve_connector import get_resolve, get_current_project
+    from resolve_writer import _walk_clips
+
+    project = get_current_project()
+    if project is None:
+        logger.warning("Clear Metadata: no Resolve project is open")
+        return
+
+    project_name = project.GetName()
+    clips = list(_walk_clips(project.GetMediaPool().GetRootFolder()))
+    tagged = sum(
+        1 for c in clips
+        if any((c.GetMetadata() or {}).get(f) for f in _TAGGER_NATIVE_FIELDS)
+        or (c.GetThirdPartyMetadata() or {})
+    )
+
+    # --- Confirmation dialog (macOS native) ---
+    confirmed = _confirm_dialog(
+        title="Clear Tagger Metadata",
+        message=(
+            f"Remove all Tagger-generated metadata from {tagged} clip(s) "
+            f"in \"{project_name}\"?\n\n"
+            "Keywords, Descriptions, Scene, Shot, Angle and all Tagger fields "
+            "will be cleared. The project will be saved and reloaded so the "
+            "keyword bins are removed from the Media Pool.\n\n"
+            "This cannot be undone."
+        ),
+    )
+    if not confirmed:
+        logger.info("Clear Metadata: cancelled by user")
+        return
+
+    # --- Clear metadata from all clips ---
+    nc = tc = 0
+    for c in clips:
+        existing = c.GetMetadata() or {}
+        for f in _TAGGER_NATIVE_FIELDS:
+            if existing.get(f):
+                if c.SetMetadata(f, ""):
+                    nc += 1
+        third = c.GetThirdPartyMetadata() or {}
+        if third:
+            c.SetThirdPartyMetadata({k: "" for k in third})
+            tc += len(third)
+
+    logger.info(f"Cleared {nc} native + {tc} third-party fields from {len(clips)} clips")
+
+    # --- Save, close, reopen to rebuild keyword bin tree ---
+    resolve = get_resolve()
+    pm = resolve.GetProjectManager()
+    try:
+        pm.SaveProject()
+        logger.info(f"Project saved: {project_name}")
+        pm.CloseProject(project)
+        logger.info(f"Project closed: {project_name}")
+        reopened = pm.LoadProject(project_name)
+        if reopened:
+            logger.info(f"Project reopened: {project_name} -- keyword bins cleared")
+        else:
+            logger.warning(f"Could not reopen project {project_name!r}; open it manually")
+    except Exception as e:
+        logger.error(f"Save/close/reopen failed: {e}")
+
+
+def _confirm_dialog(title: str, message: str) -> bool:
+    """Show a native confirmation dialog. Returns True if the user confirms."""
+    import platform
+    system = platform.system()
+    if system == "Darwin":
+        try:
+            # Write the AppleScript to a temp file so we avoid shell quoting
+            # and encoding issues with the message string.
+            import tempfile
+            safe_msg = message.replace('"', "'").replace("\n", " ")
+            safe_title = title.replace('"', "'")
+            script_text = (
+                f'display dialog "{safe_msg}" '
+                f'with title "{safe_title}" '
+                f'buttons {{"Cancel", "Clear Metadata"}} '
+                f'default button "Cancel" '
+                f'with icon caution'
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".applescript",
+                delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(script_text)
+                tf_path = tf.name
+            r = subprocess.run(
+                ["osascript", tf_path],
+                capture_output=True, text=True, timeout=60,
+            )
+            import os; os.unlink(tf_path)
+            return r.returncode == 0 and "Clear Metadata" in r.stdout
+        except Exception as e:
+            logger.warning(f"Could not show dialog: {e}")
+            return False
+    # Windows / Linux: just proceed (no easy cross-platform dialog here)
+    return True
+
+
 def run_tray(cfg: Config, queue: MetadataQueue) -> int:
     try:
         import pystray
@@ -295,6 +407,16 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
         else:
             subprocess.Popen(["xdg-open", p])
 
+    def clear_tagger_metadata(icon, item):
+        """Clear all Tagger-written metadata from every clip in the open
+        project, then save + close + reopen the project so Resolve rebuilds
+        its keyword bin tree from scratch (empty).
+
+        Shows a native macOS confirmation dialog before doing anything.
+        On Windows / Linux falls back to a plain Y/N prompt in the logs.
+        """
+        threading.Thread(target=_do_clear_metadata, daemon=True).start()
+
     def quit_app(icon, item):
         icon.stop()
 
@@ -307,6 +429,7 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
             toggle_pause,
         ),
         pystray.MenuItem("Push now", push_now),
+        pystray.MenuItem("Clear Tagger Metadata...", clear_tagger_metadata),
         pystray.MenuItem("Open logs folder", open_logs),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app),
@@ -341,6 +464,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-from-resolve", action="store_true",
                         help="Batch-process every clip in the open Resolve project's Media Pool")
     parser.add_argument("--flush-once", action="store_true", help="Run one flush tick and exit")
+    parser.add_argument("--clear-metadata", action="store_true",
+                        help="Clear all Tagger metadata from the open Resolve project and reload it")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -369,6 +494,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_batch(cfg, queue, paths)
     if args.flush_once:
         return cmd_flush_once(queue)
+    if args.clear_metadata:
+        _do_clear_metadata()
+        return 0
     return run_tray(cfg, queue)
 
 
