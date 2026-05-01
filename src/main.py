@@ -307,22 +307,34 @@ def _do_clear_metadata() -> None:
 
     logger.info(f"Project saved: {project_name}")
 
-    # --- Reload the project in-place.
-    # CloseProject() returns False when the target is the currently active
-    # project (Resolve won't close the last open project). Instead, calling
-    # LoadProject on the same name triggers an in-place reload from the
-    # saved database -- Resolve rebuilds its keyword bin tree from scratch,
-    # finding nothing because we just cleared all the keywords.
-    # This is safe: we confirmed SaveProject() returned True above, so the
-    # cleared state is on disk before we trigger the reload.
+    # --- Reload to clear keyword bins.
+    # CloseProject() returns False on the currently active project.
+    # LoadProject on the same name while it is already active does not
+    # trigger a real reload -- Resolve returns the existing handle.
+    #
+    # Reliable pattern: create a disposable empty project (switches active
+    # project away from ours), then LoadProject to pull ours fresh from the
+    # just-saved database. Resolve rebuilds the keyword bin tree from
+    # scratch; with all keywords cleared, the bins disappear.
+    _TEMP = "__TFR_temp_reload__"
+    temp = pm.CreateProject(_TEMP)
+    if not temp:
+        logger.warning(
+            "Could not create temp project for reload. Metadata is cleared "
+            "and saved. Close and reopen the project in Resolve manually to "
+            "clear the keyword bins."
+        )
+        return
+
     reloaded = pm.LoadProject(project_name)
+    pm.DeleteProject(_TEMP)
+
     if reloaded:
         logger.info(f"Project reloaded: {project_name} -- keyword bins cleared")
     else:
         logger.warning(
-            f"LoadProject({project_name!r}) returned False. "
-            "Metadata has been cleared and saved. Close and reopen the project "
-            "manually in Resolve to clear the keyword bins from the Media Pool."
+            f"LoadProject({project_name!r}) failed. Metadata is cleared and "
+            "saved. Open the project manually in Resolve."
         )
 
 
