@@ -291,21 +291,39 @@ def _do_clear_metadata() -> None:
 
     logger.info(f"Cleared {nc} native + {tc} third-party fields from {len(clips)} clips")
 
-    # --- Save, close, reopen to rebuild keyword bin tree ---
+    # --- Save FIRST. Abort if save fails -- never close an unsaved project. ---
     resolve = get_resolve()
     pm = resolve.GetProjectManager()
-    try:
-        pm.SaveProject()
-        logger.info(f"Project saved: {project_name}")
-        pm.CloseProject(project)
-        logger.info(f"Project closed: {project_name}")
-        reopened = pm.LoadProject(project_name)
-        if reopened:
-            logger.info(f"Project reopened: {project_name} -- keyword bins cleared")
-        else:
-            logger.warning(f"Could not reopen project {project_name!r}; open it manually")
-    except Exception as e:
-        logger.error(f"Save/close/reopen failed: {e}")
+
+    logger.info(f"Saving {project_name}...")
+    saved = pm.SaveProject()
+    if not saved:
+        logger.error(
+            f"SaveProject() returned False for {project_name!r}. "
+            "Metadata was cleared from clips but the project was NOT closed. "
+            "Save the project manually before reopening to clear keyword bins."
+        )
+        return
+
+    logger.info(f"Project saved: {project_name}")
+
+    # --- Reload the project in-place.
+    # CloseProject() returns False when the target is the currently active
+    # project (Resolve won't close the last open project). Instead, calling
+    # LoadProject on the same name triggers an in-place reload from the
+    # saved database -- Resolve rebuilds its keyword bin tree from scratch,
+    # finding nothing because we just cleared all the keywords.
+    # This is safe: we confirmed SaveProject() returned True above, so the
+    # cleared state is on disk before we trigger the reload.
+    reloaded = pm.LoadProject(project_name)
+    if reloaded:
+        logger.info(f"Project reloaded: {project_name} -- keyword bins cleared")
+    else:
+        logger.warning(
+            f"LoadProject({project_name!r}) returned False. "
+            "Metadata has been cleared and saved. Close and reopen the project "
+            "manually in Resolve to clear the keyword bins from the Media Pool."
+        )
 
 
 def _confirm_dialog(title: str, message: str) -> bool:
@@ -412,10 +430,12 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
         project, then save + close + reopen the project so Resolve rebuilds
         its keyword bin tree from scratch (empty).
 
-        Shows a native macOS confirmation dialog before doing anything.
-        On Windows / Linux falls back to a plain Y/N prompt in the logs.
+        Called directly (not threaded) because the Resolve scripting API
+        is not thread-safe -- calls from background threads silently fail.
+        The tray will be briefly unresponsive during the dialog + clear,
+        which is acceptable for a destructive operation.
         """
-        threading.Thread(target=_do_clear_metadata, daemon=True).start()
+        _do_clear_metadata()
 
     def quit_app(icon, item):
         icon.stop()
