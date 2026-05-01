@@ -9,7 +9,6 @@ __pycache__/
 dist/
 build/
 .eggs/
-*.spec
 .env
 *.log
 *.db
