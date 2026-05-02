@@ -24,13 +24,14 @@ from pathlib import Path
 from batch_client import (
     BatchClient, BatchSubmitError, BatchNotReady, CreditsExhaustedError,
 )
+from batch_dispatcher import BatchDispatcher
 from claude_analyzer import ClaudeAnalyzer, test_proxy_connection
-from config import Config, db_path, log_path
+from config import Config, DEMO_LIMIT, app_dir, db_path, log_path
 from flush_worker import FlushWorker
 from frame_extractor import FrameExtractor, test_ffmpeg
 from metadata_queue import MetadataQueue
 from resolve_connector import describe as describe_resolve
-from video_tagger import process_video
+from video_tagger import process_video, DemoExhaustedError
 from watcher import FolderWatcher
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ def build_analyzer(cfg: Config) -> ClaudeAnalyzer:
     return ClaudeAnalyzer(
         proxy_url=cfg.proxy_url,
         license_key=cfg.license_key,
-        hardware_id=cfg.hardware_id,
+        hardware_id=cfg.effective_hardware_id,
         description_length=cfg.description_length,
     )
 
@@ -84,8 +85,8 @@ def cmd_validate(cfg: Config) -> int:
     for k, v in info.items():
         print(f"  {k}: {v}")
     print("watch_folder: ", cfg.watch_folder or "(unset)")
-    print("license_key:  ", "set" if cfg.license_key else "(unset)")
-    print("hardware_id:  ", cfg.hardware_id or "(unset)")
+    print("license_key:  ", "subscription" if cfg.is_subscription else ("set" if cfg.license_key else "(unset)"))
+    print("hardware_id:  ", "(not needed)" if cfg.is_subscription else (cfg.hardware_id or "(unset)"))
     return 0
 
 
@@ -104,7 +105,11 @@ def cmd_process_file(cfg: Config, queue: MetadataQueue, path: str) -> int:
         print(f"file not found: {path}", file=sys.stderr)
         return 1
     analyzer = build_analyzer(cfg)
-    ok = process_video(path, analyzer, queue, tagger_version=VERSION)
+    try:
+        ok = process_video(path, analyzer, queue, tagger_version=VERSION, cfg=cfg)
+    except DemoExhaustedError as e:
+        print(f"DEMO LIMIT: {e}", file=sys.stderr)
+        return 2
     print("queued" if ok else "failed")
     return 0 if ok else 1
 
@@ -166,7 +171,7 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str]) -> int:
     bc = BatchClient(
         proxy_url=cfg.proxy_url,
         license_key=cfg.license_key,
-        hardware_id=cfg.hardware_id,
+        hardware_id=cfg.effective_hardware_id,
         description_length=cfg.description_length,
     )
 
@@ -264,13 +269,10 @@ def _do_clear_metadata() -> None:
     confirmed = _confirm_dialog(
         title="Clear Tagger Metadata",
         message=(
-            f"Remove all Tagger-generated metadata from {tagged} clip(s) "
-            f"in \"{project_name}\"?\n\n"
-            "Keywords, Descriptions, Scene, Shot, Angle and all Tagger fields "
-            "will be cleared. The project will be saved and reloaded so the "
-            "keyword bins are removed from the Media Pool.\n\n"
-            "This cannot be undone."
+            f"Clear all Tagger metadata from {tagged} clips "
+            f"in \"{project_name}\"? This cannot be undone."
         ),
+        confirm_label="Clear Metadata",
     )
     if not confirmed:
         logger.info("Clear Metadata: cancelled by user")
@@ -338,21 +340,20 @@ def _do_clear_metadata() -> None:
         )
 
 
-def _confirm_dialog(title: str, message: str) -> bool:
+def _confirm_dialog(title: str, message: str, confirm_label: str = "OK") -> bool:
     """Show a native confirmation dialog. Returns True if the user confirms."""
     import platform
     system = platform.system()
     if system == "Darwin":
         try:
-            # Write the AppleScript to a temp file so we avoid shell quoting
-            # and encoding issues with the message string.
             import tempfile
             safe_msg = message.replace('"', "'").replace("\n", " ")
             safe_title = title.replace('"', "'")
+            safe_label = confirm_label.replace('"', "'")
             script_text = (
                 f'display dialog "{safe_msg}" '
                 f'with title "{safe_title}" '
-                f'buttons {{"Cancel", "Clear Metadata"}} '
+                f'buttons {{"Cancel", "{safe_label}"}} '
                 f'default button "Cancel" '
                 f'with icon caution'
             )
@@ -367,12 +368,164 @@ def _confirm_dialog(title: str, message: str) -> bool:
                 capture_output=True, text=True, timeout=60,
             )
             import os; os.unlink(tf_path)
-            return r.returncode == 0 and "Clear Metadata" in r.stdout
+            return r.returncode == 0 and safe_label in r.stdout
         except Exception as e:
             logger.warning(f"Could not show dialog: {e}")
             return False
     # Windows / Linux: just proceed (no easy cross-platform dialog here)
     return True
+
+
+def _text_input_dialog(title: str, message: str, default: str = "") -> str | None:
+    """Show a native text input dialog. Returns the entered text, or None if cancelled."""
+    import platform
+    if platform.system() == "Darwin":
+        try:
+            import tempfile
+            safe_msg = message.replace('"', "'").replace("\n", " ")
+            safe_title = title.replace('"', "'")
+            safe_default = default.replace('"', "'")
+            script_text = (
+                f'set result to display dialog "{safe_msg}" '
+                f'with title "{safe_title}" '
+                f'default answer "{safe_default}" '
+                f'buttons {{"Cancel", "OK"}} default button "OK"'
+                f'\nreturn text returned of result'
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".applescript",
+                delete=False, encoding="utf-8"
+            ) as tf:
+                tf.write(script_text)
+                tf_path = tf.name
+            r = subprocess.run(
+                ["osascript", tf_path],
+                capture_output=True, text=True, timeout=120,
+            )
+            import os; os.unlink(tf_path)
+            if r.returncode == 0:
+                return r.stdout.strip()
+            return None
+        except Exception as e:
+            logger.warning(f"Could not show input dialog: {e}")
+            return None
+    return None
+
+
+def _show_license_dialog(cfg: Config) -> None:
+    """Prompt for a license key, validate format, and save to config."""
+    current = cfg.license_key or ""
+    entered = _text_input_dialog(
+        title="Enter License Key",
+        message="Enter your Tagger for Resolve license key to unlock the full monthly quota.",
+        default=current,
+    )
+    if entered is None:
+        return
+    entered = entered.strip()
+    if not entered:
+        return
+    if entered == current:
+        return
+
+    cfg.license_key = entered
+    cfg.save()
+    logger.info("License key saved")
+
+    import platform
+    if platform.system() == "Darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'display dialog "License key saved. Tagger for Resolve is now licensed." '
+                 'buttons {"OK"} default button "OK" with title "License Activated"'],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            pass
+
+
+def _folder_picker_dialog(title: str, default: str = "") -> str | None:
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    try:
+        loc = ""
+        if default:
+            loc = f' default location POSIX file "{default}"'
+        script = f'POSIX path of (choose folder with prompt "{title}"{loc})'
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0:
+            return r.stdout.strip()
+        return None
+    except Exception as e:
+        logger.warning(f"Folder picker failed: {e}")
+        return None
+
+
+def _choose_from_list_dialog(title: str, options: list[str], default: str = "") -> str | None:
+    import platform
+    if platform.system() != "Darwin":
+        return None
+    try:
+        items = ", ".join(f'"{o}"' for o in options)
+        default_item = f' default items {{"{default}"}}' if default in options else ""
+        script = (
+            f'choose from list {{{items}}} '
+            f'with prompt "{title}"{default_item} '
+            f'without multiple selections allowed'
+        )
+        r = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0:
+            val = r.stdout.strip()
+            if val and val != "false":
+                return val
+        return None
+    except Exception as e:
+        logger.warning(f"Choose from list failed: {e}")
+        return None
+
+
+def cmd_uninstall() -> int:
+    """Remove the app from /Applications and delete all app data."""
+    import shutil
+
+    app_path = Path("/Applications/Tagger for Resolve.app")
+    data_dir = app_dir()
+
+    found = []
+    if app_path.exists():
+        found.append(str(app_path))
+    if data_dir.exists():
+        found.append(str(data_dir))
+
+    if not found:
+        print("Tagger for Resolve is not installed.")
+        return 0
+
+    print("This will remove:")
+    for p in found:
+        print(f"  {p}")
+    answer = input("\nProceed? [y/N] ").strip().lower()
+    if answer != "y":
+        print("Cancelled.")
+        return 0
+
+    if app_path.exists():
+        shutil.rmtree(app_path)
+        print(f"  Removed {app_path}")
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
+        print(f"  Removed {data_dir}")
+
+    print("Uninstall complete.")
+    return 0
 
 
 def run_tray(cfg: Config, queue: MetadataQueue) -> int:
@@ -384,16 +537,41 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
         return 1
 
     analyzer = build_analyzer(cfg)
-    worker = FlushWorker(queue, paused=not cfg.auto_push)
+    worker = FlushWorker(queue)
     worker.start()
+
+    icon_image = _make_icon()
+    animation_frames = _load_animation_frames()
+    icon = pystray.Icon("TaggerResolve", icon_image, "Tagger for Resolve")
+
+    # Processing animation state
+    _anim_lock = threading.Lock()
+    _processing_count = 0
+    _frame_index = 0
+    _anim_stop = threading.Event()
+
+    def _processing_count_inc():
+        nonlocal _processing_count
+        with _anim_lock:
+            _processing_count += 1
+
+    def _processing_count_dec():
+        nonlocal _processing_count
+        with _anim_lock:
+            _processing_count = max(0, _processing_count - 1)
+
+    dispatcher = BatchDispatcher(
+        cfg=cfg, queue=queue, tagger_version=VERSION, analyzer=analyzer,
+        on_batch_start=_processing_count_inc,
+        on_batch_end=_processing_count_dec,
+    )
+    dispatcher.start()
+
+    def on_stable(p: str) -> None:
+        dispatcher.add(p)
 
     watcher: FolderWatcher | None = None
     if cfg.watch_folder and Path(cfg.watch_folder).is_dir():
-        def on_stable(p: str) -> None:
-            try:
-                process_video(p, analyzer, queue, tagger_version=VERSION)
-            except Exception as e:
-                logger.exception(f"process_video failed for {p}: {e}")
         watcher = FolderWatcher(cfg.watch_folder, on_stable)
         try:
             watcher.start()
@@ -403,8 +581,27 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
     else:
         logger.warning("watch_folder not configured; running in queue-only mode")
 
-    icon_image = _make_icon()
-    icon = pystray.Icon("TaggerResolve", icon_image, "Tagger for Resolve")
+    def _animation_tick():
+        nonlocal _frame_index
+        while not _anim_stop.is_set():
+            with _anim_lock:
+                active = _processing_count > 0
+            if active and animation_frames:
+                _frame_index = (_frame_index + 1) % len(animation_frames)
+                icon.icon = animation_frames[_frame_index]
+            elif _frame_index != 0:
+                _frame_index = 0
+                icon.icon = icon_image
+            _anim_stop.wait(0.08)
+
+    if animation_frames:
+        anim_thread = threading.Thread(target=_animation_tick, daemon=True)
+        anim_thread.start()
+
+    def license_status(_):
+        if cfg.is_licensed:
+            return "Licensed"
+        return f"Demo: {cfg.demo_remaining}/{DEMO_LIMIT} files remaining"
 
     def status_text(_):
         c = queue.counts_by_status()
@@ -415,15 +612,105 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
     def worker_status(_):
         return worker.status()
 
-    def toggle_pause(icon, item):
-        if worker.paused:
-            worker.resume()
-        else:
-            worker.pause()
+    def tag_open_project(icon, item):
+        def _run():
+            from resolve_connector import get_current_project
+            from resolve_writer import _walk_clips
+
+            project = get_current_project()
+            if project is None:
+                logger.warning("Tag Open Project: no Resolve project is open")
+                return
+
+            clips = list(_walk_clips(project.GetMediaPool().GetRootFolder()))
+            paths = [c.GetClipProperty("File Path") for c in clips]
+            paths = [p for p in paths if p and Path(p).exists()]
+
+            if not paths:
+                logger.warning("Tag Open Project: no clips with valid file paths")
+                return
+
+            logger.info(f"Tag Open Project: processing {len(paths)} clips")
+            _processing_count_inc()
+            try:
+                for i, p in enumerate(paths, 1):
+                    name = Path(p).name
+                    logger.info(f"  [{i}/{len(paths)}] {name}")
+                    try:
+                        process_video(p, analyzer, queue, tagger_version=VERSION, cfg=cfg)
+                    except DemoExhaustedError as e:
+                        logger.warning(str(e))
+                        break
+                    except Exception as e:
+                        logger.exception(f"  Failed: {name}: {e}")
+
+                logger.info("Tag Open Project: done, flushing queue to Resolve")
+                worker._tick()
+
+                try:
+                    project_name = project.GetName()
+                    from resolve_connector import get_resolve
+                    resolve = get_resolve()
+                    if resolve is None:
+                        logger.warning("Reload: get_resolve() returned None")
+                    else:
+                        pm = resolve.GetProjectManager()
+                        pm.SaveProject()
+                        _TEMP = "__TFR_temp_reload__"
+                        temp = pm.CreateProject(_TEMP)
+                        if temp:
+                            reloaded = pm.LoadProject(project_name)
+                            pm.DeleteProject(_TEMP)
+                            if reloaded:
+                                logger.info(f"Project reloaded: {project_name}")
+                            else:
+                                logger.warning(f"LoadProject({project_name!r}) failed. Reopen manually.")
+                        else:
+                            logger.warning("Could not create temp project for reload. Reopen manually.")
+                except Exception as e:
+                    logger.exception(f"Reload failed: {e}")
+            finally:
+                _processing_count_dec()
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def enter_license(icon, item):
+        _show_license_dialog(cfg)
+        nonlocal analyzer
+        analyzer = build_analyzer(cfg)
         icon.update_menu()
 
-    def push_now(icon, item):
-        threading.Thread(target=worker._tick, daemon=True).start()
+    def show_settings(icon, item):
+        nonlocal analyzer, watcher
+
+        folder = _folder_picker_dialog(
+            "Choose a watch folder (or Cancel to skip)",
+            default=cfg.watch_folder,
+        )
+        if folder is not None:
+            old_folder = cfg.watch_folder
+            cfg.watch_folder = folder.rstrip("/")
+            if cfg.watch_folder != old_folder:
+                if watcher is not None:
+                    watcher.stop()
+                    watcher = None
+                if cfg.watch_folder and Path(cfg.watch_folder).is_dir():
+                    watcher = FolderWatcher(cfg.watch_folder, on_stable)
+                    watcher.start()
+                    logger.info(f"Watcher restarted: {cfg.watch_folder}")
+
+        desc = _choose_from_list_dialog(
+            "Description length",
+            ["brief", "standard", "detailed"],
+            default=cfg.description_length,
+        )
+        if desc is not None:
+            cfg.description_length = desc
+
+        cfg.save()
+        analyzer = build_analyzer(cfg)
+        icon.update_menu()
+        logger.info("Settings saved")
 
     def open_logs(icon, item):
         import subprocess
@@ -438,30 +725,23 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
             subprocess.Popen(["xdg-open", p])
 
     def clear_tagger_metadata(icon, item):
-        """Clear all Tagger-written metadata from every clip in the open
-        project, then save + close + reopen the project so Resolve rebuilds
-        its keyword bin tree from scratch (empty).
-
-        Called directly (not threaded) because the Resolve scripting API
-        is not thread-safe -- calls from background threads silently fail.
-        The tray will be briefly unresponsive during the dialog + clear,
-        which is acceptable for a destructive operation.
-        """
         _do_clear_metadata()
 
     def quit_app(icon, item):
+        _anim_stop.set()
         icon.stop()
 
     icon.menu = pystray.Menu(
+        pystray.MenuItem(license_status, None, enabled=False),
         pystray.MenuItem(status_text, None, enabled=False),
         pystray.MenuItem(worker_status, None, enabled=False),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem(
-            lambda _: "Resume auto-push" if worker.paused else "Pause auto-push",
-            toggle_pause,
-        ),
-        pystray.MenuItem("Push now", push_now),
-        pystray.MenuItem("Clear Tagger Metadata...", clear_tagger_metadata),
+        pystray.MenuItem("Tag Open Project", tag_open_project),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Clear Tagger Metadata", clear_tagger_metadata),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Settings...", show_settings),
+        pystray.MenuItem("Enter License Key", enter_license),
         pystray.MenuItem("Open logs folder", open_logs),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", quit_app),
@@ -470,20 +750,46 @@ def run_tray(cfg: Config, queue: MetadataQueue) -> int:
     try:
         icon.run()
     finally:
+        _anim_stop.set()
+        dispatcher.stop()
         worker.stop()
         if watcher is not None:
             watcher.stop()
     return 0
 
 
+def _assets_dir() -> Path:
+    """Return the assets directory, works both in dev and PyInstaller bundle."""
+    if getattr(sys, "_MEIPASS", None):
+        return Path(sys._MEIPASS) / "assets"
+    return Path(__file__).parent / "assets"
+
+
+def _load_icon(path: Path):
+    """Load a PNG as a PIL Image for pystray."""
+    from PIL import Image
+    return Image.open(path).convert("RGBA")
+
+
 def _make_icon():
-    """Generate a simple 64x64 sage-green square icon for the tray."""
+    """Load the clapperboard menu bar icon."""
+    icon_path = _assets_dir() / "tagger_menubar.png"
+    if icon_path.exists():
+        return _load_icon(icon_path)
     from PIL import Image, ImageDraw
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    img = Image.new("RGBA", (44, 44), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle((4, 4, 60, 60), radius=12, fill=(62, 124, 110, 255))
-    draw.text((18, 16), "T", fill=(247, 243, 235, 255))
+    draw.rounded_rectangle((2, 2, 42, 42), radius=8, fill=(62, 124, 110, 255))
     return img
+
+
+def _load_animation_frames() -> list:
+    """Load the 24-frame sage-to-terracotta processing animation."""
+    frames_dir = _assets_dir() / "menubar_frames"
+    if not frames_dir.is_dir():
+        return []
+    paths = sorted(frames_dir.glob("frame_*.png"))
+    return [_load_icon(p) for p in paths]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -498,6 +804,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--flush-once", action="store_true", help="Run one flush tick and exit")
     parser.add_argument("--clear-metadata", action="store_true",
                         help="Clear all Tagger metadata from the open Resolve project and reload it")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="Remove app from /Applications and delete all app data")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
 
@@ -529,6 +837,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.clear_metadata:
         _do_clear_metadata()
         return 0
+    if args.uninstall:
+        return cmd_uninstall()
     return run_tray(cfg, queue)
 
 

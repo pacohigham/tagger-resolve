@@ -4,7 +4,7 @@
 
 | Platform | Output | Format |
 |---|---|---|
-| macOS   | `dist/Tagger for Resolve.app` | `.app` bundle (LSUIElement, no Dock icon) |
+| macOS   | `dist/Tagger for Resolve <ver>.dmg` | DMG installer with drag-to-Applications |
 | Windows | `dist/Tagger for Resolve/Tagger for Resolve.exe` | folder with .exe |
 | Linux   | `dist/Tagger for Resolve/Tagger for Resolve` | folder with executable |
 
@@ -28,9 +28,18 @@ cd "/Users/sn4ck5/Desktop/Tagger for Resolve v0.1.0"
 .venv/bin/pyinstaller --noconfirm "Tagger for Resolve.spec"
 ```
 
-Output: `dist/Tagger for Resolve.app` -- ~35 MB.
+Output: `dist/Tagger for Resolve.app` (~35 MB).
 
-Test before distributing:
+### Create the DMG installer
+
+```bash
+./create_dmg.sh
+```
+
+Output: `dist/Tagger for Resolve 0.1.0.dmg` (~14 MB). Opens with a drag-to-Applications layout. The version number in the DMG filename comes from the `VERSION` file.
+
+### Test before distributing
+
 ```bash
 "dist/Tagger for Resolve.app/Contents/MacOS/Tagger for Resolve" --validate
 open "dist/Tagger for Resolve.app"   # should appear as a tray icon in the menu bar
@@ -53,7 +62,7 @@ For shippable builds:
             --sign "Developer ID Application: Your Name (TEAMID)" \
             "dist/Tagger for Resolve.app"
    ```
-4. Notarize:
+4. Notarize the .app, then build the DMG:
    ```bash
    xcrun notarytool submit "dist/Tagger for Resolve.app.zip" \
             --apple-id YOUR@APPLE.ID \
@@ -61,6 +70,7 @@ For shippable builds:
             --password APP_SPECIFIC_PASSWORD \
             --wait
    xcrun stapler staple "dist/Tagger for Resolve.app"
+   ./create_dmg.sh
    ```
 
 ## Windows build
@@ -101,3 +111,9 @@ Also bump the `CFBundleShortVersionString` and `CFBundleVersion` in the spec's `
 
 - `dist/` and `build/` are gitignored. Rebuild from source.
 - `Tagger for Resolve.spec` IS committed -- it's our build configuration.
+- `TaggerResolve.icns` IS committed -- the app icon.
+- `create_dmg.sh` IS committed -- builds the macOS DMG installer.
+
+## App icon
+
+`TaggerResolve.icns` is the app icon (sage green square with white "T"). To regenerate it from scratch, create a `TaggerResolve.iconset/` folder with PNGs at standard sizes (16 through 1024, plus @2x variants) and run `iconutil -c icns TaggerResolve.iconset -o TaggerResolve.icns`. The iconset folder is gitignored.

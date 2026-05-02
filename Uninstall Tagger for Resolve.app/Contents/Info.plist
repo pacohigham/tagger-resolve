@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>uninstall</string>
+    <key>CFBundleIdentifier</key>
+    <string>mov.tagger.taggerresolve.uninstaller</string>
+    <key>CFBundleName</key>
+    <string>Uninstall Tagger for Resolve</string>
+    <key>CFBundleDisplayName</key>
+    <string>Uninstall Tagger for Resolve</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>TaggerResolve.icns</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright (c) 2026 Tagger, LLC</string>
+</dict>
+</plist>

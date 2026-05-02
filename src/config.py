@@ -11,13 +11,20 @@ Schema is intentionally flat. Created on first run with defaults.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import platform
+import re
+import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
+
+_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,9 @@ def log_path() -> Path:
     return logs / "tagger-resolve.log"
 
 
+DEMO_LIMIT = 20
+
+
 @dataclass
 class Config:
     proxy_url: str = "https://tagger-1t2g.onrender.com"
@@ -56,13 +66,40 @@ class Config:
     hardware_id: str = ""
     watch_folder: str = ""
     description_length: str = "standard"   # brief | standard | detailed
-    auto_push: bool = True
+    batch_size: int = 8
+    batch_window_seconds: float = 60.0
+    demo_files_used: int = 0
+
+    @property
+    def is_licensed(self) -> bool:
+        return bool(self.license_key)
+
+    @property
+    def is_subscription(self) -> bool:
+        return bool(_UUID_RE.match(self.license_key.strip())) if self.license_key else False
+
+    @property
+    def effective_hardware_id(self) -> str:
+        return "" if self.is_subscription else self.hardware_id
+
+    @property
+    def demo_remaining(self) -> int:
+        return max(0, DEMO_LIMIT - self.demo_files_used)
+
+    def use_demo_file(self) -> bool:
+        """Consume one demo credit. Returns False if none left."""
+        if self.demo_files_used >= DEMO_LIMIT:
+            return False
+        self.demo_files_used += 1
+        self.save()
+        return True
 
     @classmethod
     def load(cls) -> "Config":
         path = config_path()
         if not path.exists():
             cfg = cls()
+            cfg._ensure_hardware_id()
             cfg.save()
             return cfg
         try:
@@ -71,9 +108,19 @@ class Config:
         except Exception as e:
             logger.error(f"Could not read config, using defaults: {e}")
             return cls()
-        # Tolerate extra keys; only consume known fields
         known = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        cfg = cls(**{k: v for k, v in data.items() if k in known})
+        if cfg._ensure_hardware_id():
+            cfg.save()
+        return cfg
+
+    def _ensure_hardware_id(self) -> bool:
+        """Generate a stable hardware ID if not set. Returns True if changed."""
+        if self.hardware_id:
+            return False
+        raw = platform.node() + "-" + str(uuid.getnode())
+        self.hardware_id = "TFR-" + hashlib.sha256(raw.encode()).hexdigest()[:16].upper()
+        return True
 
     def save(self) -> None:
         path = config_path()

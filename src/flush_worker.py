@@ -76,7 +76,7 @@ class FlushWorker:
 
         pending = self.queue.list_pending(limit=BATCH_SIZE)
         if not pending:
-            self._last_status = f"idle (project: {project.GetName()})"
+            self._last_status = f"Project: {project.GetName()}"
             return
 
         wrote = 0

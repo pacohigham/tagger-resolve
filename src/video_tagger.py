@@ -13,8 +13,13 @@ import time
 from pathlib import Path
 
 from claude_analyzer import ClaudeAnalyzer, CreditsExhaustedError
+from config import Config
 from frame_extractor import FrameExtractor
 from metadata_queue import MetadataQueue
+
+
+class DemoExhaustedError(Exception):
+    """All 20 free demo files have been used."""
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +36,23 @@ def process_video(
     analyzer: ClaudeAnalyzer,
     queue: MetadataQueue,
     tagger_version: str = "0.1.0",
+    cfg: Config | None = None,
 ) -> bool:
     """Process a single video file end-to-end.
 
     Returns True if metadata was queued for Resolve write. On hard
     failure (invalid file, no metadata after retry) returns False and
-    logs. CreditsExhaustedError is propagated so the watcher can
-    surface a tray notification.
+    logs. CreditsExhaustedError and DemoExhaustedError are propagated
+    so the caller can surface a notification.
     """
+    is_demo = cfg and not cfg.is_licensed
+    if is_demo:
+        if cfg.demo_remaining <= 0:
+            raise DemoExhaustedError(
+                f"All {DEMO_LIMIT} free demo files used. "
+                "Enter a license key to continue."
+            )
+
     name = Path(video_path).name
     logger.info(f"Processing {name}")
 
@@ -89,5 +103,10 @@ def process_video(
         metadata["color_space"] = info["color_label"]
 
     row_id = queue.enqueue(video_path, metadata, duration_s=duration)
+
+    if is_demo:
+        cfg.use_demo_file()
+        logger.info(f"{name}: demo file used, {cfg.demo_remaining}/{DEMO_LIMIT} remaining")
+
     logger.info(f"{name}: queued as row {row_id}")
     return True

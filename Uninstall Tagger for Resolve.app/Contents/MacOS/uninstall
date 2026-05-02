@@ -1,0 +1,43 @@
+#!/bin/bash
+# Tagger for Resolve -- Uninstaller
+# Copyright 2026 Tagger, LLC
+
+APP_DIR="/Applications/Tagger for Resolve"
+DATA_DIR="$HOME/Library/Application Support/TaggerResolve"
+
+# Build the list of what will be removed
+ITEMS=""
+if [ -d "$APP_DIR" ]; then
+    ITEMS="$ITEMS\n- $APP_DIR"
+fi
+if [ -d "$DATA_DIR" ]; then
+    ITEMS="$ITEMS\n- $DATA_DIR (config, logs, queue)"
+fi
+
+if [ -z "$ITEMS" ]; then
+    osascript -e 'display dialog "Tagger for Resolve is not installed." buttons {"OK"} default button "OK" with title "Uninstall Tagger for Resolve" with icon note'
+    exit 0
+fi
+
+# Confirmation dialog
+RESULT=$(osascript -e "display dialog \"This will remove Tagger for Resolve from your computer and delete all app data.\" buttons {\"Cancel\", \"Uninstall\"} default button \"Cancel\" with title \"Uninstall Tagger for Resolve\" with icon caution" 2>&1)
+
+if [[ "$RESULT" != *"Uninstall"* ]]; then
+    exit 0
+fi
+
+# Quit the running app if active
+pkill -f "Tagger for Resolve" 2>/dev/null
+sleep 1
+
+# Remove the application folder
+if [ -d "$APP_DIR" ]; then
+    rm -rf "$APP_DIR"
+fi
+
+# Remove app data
+if [ -d "$DATA_DIR" ]; then
+    rm -rf "$DATA_DIR"
+fi
+
+osascript -e 'display dialog "Tagger for Resolve has been uninstalled." buttons {"OK"} default button "OK" with title "Uninstall Complete" with icon note'

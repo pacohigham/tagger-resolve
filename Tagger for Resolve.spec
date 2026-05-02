@@ -60,8 +60,10 @@ a = Analysis(
     pathex=[SRC_DIR],
     binaries=[],
     datas=[
-        # bundle VERSION so --validate can show it
         ("VERSION", "."),
+        (str(Path(SRC_DIR) / "assets" / "tagger_menubar.png"), "assets"),
+        (str(Path(SRC_DIR) / "assets" / "tagger_512.png"), "assets"),
+        (str(Path(SRC_DIR) / "assets" / "menubar_frames"), "assets/menubar_frames"),
     ],
     hiddenimports=hidden_imports,
     hookspath=[],
@@ -116,15 +118,14 @@ if platform.system() == "Darwin":
     app = BUNDLE(
         coll,
         name=f"{APP_NAME}.app",
-        icon=None,                 # add .icns later
+        icon="TaggerResolve.icns",
         bundle_identifier="mov.tagger.taggerresolve",
         info_plist={
             "CFBundleShortVersionString":  "0.1.0",
             "CFBundleVersion":             "0.1.0",
             "CFBundleName":                APP_NAME,
             "CFBundleDisplayName":         APP_NAME,
-            # Tray app -- no Dock icon, no menu bar, runs as accessory
-            "LSUIElement":                 True,
+            "LSUIElement":                 False,
             "NSHighResolutionCapable":     True,
             # macOS 11+ for Resolve Studio scripting reliability
             "LSMinimumSystemVersion":      "11.0",

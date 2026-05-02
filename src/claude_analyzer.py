@@ -55,12 +55,12 @@ class ClaudeAnalyzer:
         if not self.proxy_url:
             logger.error("proxy_url not configured")
             return {}
-        if not self.hardware_id:
+        effective_key = self.license_key or "DEMO-DEMO-DEMO-DEMO"
+
+        if not self.hardware_id and effective_key == "DEMO-DEMO-DEMO-DEMO":
             raise MissingCredentialsError(
                 "Hardware ID is not set. Open Settings to configure it."
             )
-
-        effective_key = self.license_key or "DEMO-DEMO-DEMO-DEMO"
 
         try:
             image_b64 = self.encode_image(stitched_path)

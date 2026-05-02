@@ -6,7 +6,7 @@ without BRAW support (deferred for a future release).
 
 Produces a single 5760x4320 JPEG containing:
   - 64px metadata header strip (filename, duration, fps, resolution, codec)
-  - N frame tiles in a 3-column grid where N = clamp(int(dur/24)+1, 4, 20)
+  - N frame tiles in a 3-column grid where N = clamp(int(dur/24)+1, 6, 20)
   - each tile annotated with its source timecode (HH:MM:SS:FF)
 
 Adaptive JPEG quality keeps file size under 4.8 MB for Claude's 5 MB limit.
@@ -552,7 +552,7 @@ class FrameExtractor:
 
     @staticmethod
     def _compute_frame_count(duration: float) -> int:
-        return max(4, min(20, int(duration / 24) + 1))
+        return max(6, min(20, int(duration / 24) + 1))
 
     @staticmethod
     def _compute_cell_height(n: int) -> int:
