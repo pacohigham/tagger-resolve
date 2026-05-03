@@ -51,6 +51,16 @@ def save_and_reload_project(project_name: str) -> bool:
     logger.info(f"Project saved: {project_name}")
 
     _TEMP = "__TFR_temp_reload__"
+
+    if project_name == _TEMP:
+        logger.warning("Active project is the temp project itself. Open your project manually.")
+        return False
+
+    # Clean up leftover temp from a prior failed reload
+    if pm.LoadProject(_TEMP):
+        pm.LoadProject(project_name)
+        pm.DeleteProject(_TEMP)
+
     temp = pm.CreateProject(_TEMP)
     if not temp:
         logger.warning(
@@ -60,6 +70,12 @@ def save_and_reload_project(project_name: str) -> bool:
         return False
 
     reloaded = pm.LoadProject(project_name)
+    if not reloaded:
+        logger.warning(
+            f"LoadProject({project_name!r}) failed after switching to temp. "
+            "Attempting to delete temp and recover."
+        )
+
     pm.DeleteProject(_TEMP)
 
     if reloaded:
