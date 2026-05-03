@@ -210,24 +210,34 @@ def run_tray(cfg: Config, queue: MetadataQueue, version: str) -> int:
         analyzer = build_analyzer(cfg)
         icon.update_menu()
 
-    def show_settings(icon, item):
-        nonlocal analyzer, watcher
-
+    def set_watch_folder(icon, item):
+        nonlocal watcher
         folder = folder_picker(
             "Choose a watch folder (or Cancel to skip)",
             default=cfg.watch_folder,
         )
-        if folder is not None:
-            old_folder = cfg.watch_folder
-            cfg.watch_folder = folder.rstrip("/")
-            if cfg.watch_folder != old_folder:
-                if watcher is not None:
-                    watcher.stop()
-                    watcher = None
-                if cfg.watch_folder and Path(cfg.watch_folder).is_dir():
-                    watcher = FolderWatcher(cfg.watch_folder, on_stable)
-                    watcher.start()
-                    logger.info(f"Watcher restarted: {cfg.watch_folder}")
+        if folder is None:
+            return
+        old_folder = cfg.watch_folder
+        cfg.watch_folder = folder.rstrip("/")
+        if cfg.watch_folder != old_folder:
+            if watcher is not None:
+                watcher.stop()
+                watcher = None
+            if cfg.watch_folder and Path(cfg.watch_folder).is_dir():
+                watcher = FolderWatcher(cfg.watch_folder, on_stable)
+                watcher.start()
+                logger.info(f"Watcher restarted: {cfg.watch_folder}")
+        cfg.save()
+        icon.update_menu()
+
+    def watch_folder_label(_):
+        if cfg.watch_folder:
+            return f"Watch: {Path(cfg.watch_folder).name}"
+        return "Watch Folder: (none)"
+
+    def show_settings(icon, item):
+        nonlocal analyzer
 
         desc = choose_from_list(
             "Description length",
@@ -266,6 +276,8 @@ def run_tray(cfg: Config, queue: MetadataQueue, version: str) -> int:
         pystray.MenuItem(worker_status, None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Tag Open Project", tag_open_project),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(watch_folder_label, set_watch_folder),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Clear Tagger Metadata", clear_tagger_metadata),
         pystray.Menu.SEPARATOR,
