@@ -1,10 +1,9 @@
 # Copyright 2026 Tagger, LLC -- support@tagger.mov
-"""Batch dispatcher: collects files into windowed batches for the Batch API.
+"""Dispatcher: collects files into windowed groups, tags via sync API.
 
 The watcher and Tag Open Project feed file paths into add(). When the
 window reaches N files or T seconds (whichever first), the dispatcher
-extracts frames, submits a batch, polls for results, and enqueues
-metadata into the local SQLite queue.
+processes each file synchronously via the proxy server (~4s per clip).
 """
 
 from __future__ import annotations
@@ -15,14 +14,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from batch_client import (
-    BatchClient,
-    BatchSubmitError,
-    CreditsExhaustedError,
-)
 from claude_analyzer import ClaudeAnalyzer
 from config import Config
-from frame_extractor import FrameExtractor
 from metadata_queue import MetadataQueue
 from video_tagger import process_video, DemoExhaustedError
 
@@ -147,131 +140,26 @@ class BatchDispatcher:
                 return
 
     def _process_batch(self, paths: list[str]) -> None:
-        logger.info(f"Batch: extracting frames for {len(paths)} files")
+        logger.info(f"Processing {len(paths)} files")
         self._on_start()
-
-        items: list[tuple[str, str, str, float, str, dict]] = []
-        temp_dirs: list[str] = []
-
         try:
-            for i, path in enumerate(paths, 1):
-                name = Path(path).name
-                self._status = f"Extracting {i}/{len(paths)}: {name}"
-                if not Path(path).exists():
-                    logger.warning(f"  [{i}/{len(paths)}] SKIP (missing): {path}")
-                    continue
-                duration = FrameExtractor.get_duration(path)
-                if duration is None:
-                    logger.warning(f"  [{i}/{len(paths)}] SKIP (no duration): {name}")
-                    continue
-                stitched, td = FrameExtractor.extract_and_stitch(path)
-                if td:
-                    temp_dirs.append(td)
-                if not stitched:
-                    logger.warning(f"  [{i}/{len(paths)}] SKIP (stitch failed): {name}")
-                    continue
-                b64 = BatchClient.encode_image(stitched)
-                info = FrameExtractor._get_video_info(path) or {}
-                custom_id = f"job-{i:04d}"
-                items.append((custom_id, b64, name, duration, path, info))
-                logger.info(f"  [{i}/{len(paths)}] stitched: {name} ({len(b64)//1024} KB)")
-
-            if not items:
-                logger.warning("Batch: no valid files to submit")
-                return
-
-            bc = BatchClient(
-                proxy_url=self._cfg.proxy_url,
-                license_key=self._cfg.license_key,
-                hardware_id=self._cfg.effective_hardware_id,
-                description_length=self._cfg.description_length,
-            )
-
-            self._status = f"Submitting {len(items)} files..."
-            logger.info(f"Batch: submitting {len(items)} items")
-            try:
-                sub = bc.submit([(cid, b64, n) for (cid, b64, n, _, _, _) in items])
-            except CreditsExhaustedError as e:
-                logger.warning(f"Batch: credits exhausted, falling back to sync: {e}")
-                self._sync_fallback(paths)
-                return
-            except BatchSubmitError as e:
-                logger.error(f"Batch: submit failed, falling back to sync: {e}")
-                self._sync_fallback(paths)
-                return
-
-            logger.info(
-                f"Batch: submitted batch_id={sub.batch_id} "
-                f"pre_deducted={sub.credits_pre_deducted} balance={sub.credits_remaining}"
-            )
-
-            def _progress(st):
-                c = st.counts
-                done = c.get('succeeded', 0)
-                errs = c.get('errored', 0)
-                left = c.get('processing', 0)
-                self._status = f"Tagging: {done} done, {left} processing"
-                if errs:
-                    self._status += f", {errs} failed"
-                logger.info(
-                    f"Batch {sub.batch_id}: {st.processing_status} "
-                    f"processing={left} succeeded={done} errored={errs}"
-                )
-
-            try:
-                res = bc.wait_for(sub.batch_id, poll_interval=10.0, progress_cb=_progress)
-            except TimeoutError as e:
-                logger.error(f"Batch: polling timed out: {e}")
-                return
-
-            logger.info(
-                f"Batch ended: succeeded={res.succeeded} failed={res.failed} "
-                f"refunded={res.credits_refunded} balance={res.credits_remaining}"
-            )
-
-            by_id = {cid: (n, d, p, info) for (cid, _, n, d, p, info) in items}
-            enqueued = 0
-            is_demo = self._cfg and not self._cfg.is_licensed
-            for r in res.results:
-                if r.status != "succeeded" or not r.metadata:
-                    logger.warning(f"  [{r.custom_id}] {r.status}: {r.error or '(no metadata)'}")
-                    continue
-                meta = dict(r.metadata)
-                meta.setdefault("tagger_version", self._version)
-                meta.setdefault("tagger_schema", bc.schema_version)
-                meta.setdefault("processed_at", str(int(time.time())))
-                name, dur, path, info = by_id[r.custom_id]
-                if info.get("camera_make"):
-                    meta["camera_make"] = info["camera_make"]
-                if info.get("camera_model"):
-                    meta["camera_model"] = info["camera_model"]
-                if info.get("color_label"):
-                    meta["color_space"] = info["color_label"]
-                self._queue.enqueue(path, meta, duration_s=dur)
-                enqueued += 1
-                if is_demo:
-                    self._cfg.use_demo_file()
-                logger.info(f"  [{r.custom_id}] OK: {name}")
-
-            logger.info(f"Batch: queued {enqueued} items for Resolve write")
-
+            ok = 0
+            for i, p in enumerate(paths, 1):
+                name = Path(p).name
+                self._status = f"Tagging {i}/{len(paths)}: {name}"
+                try:
+                    if process_video(
+                        p, self._analyzer, self._queue,
+                        tagger_version=self._version, cfg=self._cfg,
+                    ):
+                        ok += 1
+                        logger.info(f"  [{i}/{len(paths)}] OK: {name}")
+                except DemoExhaustedError as e:
+                    logger.warning(str(e))
+                    break
+                except Exception as e:
+                    logger.exception(f"  [{i}/{len(paths)}] FAILED: {name}: {e}")
+            logger.info(f"Done: {ok}/{len(paths)} queued for Resolve write")
         finally:
             self._status = ""
-            for td in temp_dirs:
-                FrameExtractor.cleanup_frames([], td)
             self._on_end()
-
-    def _sync_fallback(self, paths: list[str]) -> None:
-        logger.info(f"Sync fallback: processing {len(paths)} files individually")
-        for p in paths:
-            name = Path(p).name
-            try:
-                process_video(
-                    p, self._analyzer, self._queue,
-                    tagger_version=self._version, cfg=self._cfg,
-                )
-            except DemoExhaustedError as e:
-                logger.warning(str(e))
-                break
-            except Exception as e:
-                logger.exception(f"Sync fallback failed: {name}: {e}")

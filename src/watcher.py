@@ -78,7 +78,7 @@ class FolderWatcher:
         )
         self._poll_thread.start()
         logger.info(f"Watching: {self.folder}")
-        self._enqueue_existing()
+        self._snapshot_existing()
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -87,11 +87,17 @@ class FolderWatcher:
             self._observer.join(timeout=5)
             self._observer = None
 
-    def _enqueue_existing(self) -> None:
+    def _snapshot_existing(self) -> None:
+        """Mark files already in the folder as processed so only new arrivals trigger tagging."""
+        count = 0
         for root, _, files in os.walk(self.folder):
             for f in files:
                 p = os.path.join(root, f)
-                self._enqueue_candidate(p)
+                if Path(p).suffix.lower() in self.extensions:
+                    self._processed.add(p)
+                    count += 1
+        if count:
+            logger.info(f"Skipping {count} existing files in watch folder")
 
     def _enqueue_candidate(self, path: str) -> None:
         if Path(path).suffix.lower() not in self.extensions:
