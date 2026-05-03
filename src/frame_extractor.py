@@ -20,6 +20,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -37,12 +38,31 @@ _FFMPEG_SEARCH_PATHS = [
 ]
 
 
+def _bundled_bin_dir() -> Optional[str]:
+    """Return the path to bundled binaries inside the PyInstaller app, or None."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return os.path.join(meipass, "bin")
+    return None
+
+
 def _find_tool(name: str) -> str:
-    """Return the full path to an ffmpeg tool, or the bare name as fallback."""
+    """Return the full path to an ffmpeg tool, or the bare name as fallback.
+
+    Checks the PyInstaller bundle first (Contents/Resources/bin/ inside the
+    .app), then falls back to well-known system paths and PATH search.
+    """
     if platform.system() == "Windows" and not name.endswith(".exe"):
         name_with_ext = name + ".exe"
     else:
         name_with_ext = name
+
+    bundled = _bundled_bin_dir()
+    if bundled:
+        candidate = os.path.join(bundled, name_with_ext)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
     for directory in _FFMPEG_SEARCH_PATHS:
         candidate = os.path.join(directory, name_with_ext)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):

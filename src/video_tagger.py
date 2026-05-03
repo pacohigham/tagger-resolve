@@ -9,12 +9,12 @@ at shifted temporal positions (pct_offset=0.075) and try once more.
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 
 from claude_analyzer import ClaudeAnalyzer, CreditsExhaustedError
 from config import Config
 from frame_extractor import FrameExtractor
+from metadata_merge import merge_technical_metadata
 from metadata_queue import MetadataQueue
 
 
@@ -88,19 +88,12 @@ def process_video(
         logger.error(f"{name}: no metadata produced")
         return False
 
-    metadata.setdefault("tagger_version", tagger_version)
-    metadata.setdefault("tagger_schema", getattr(analyzer, "schema_version", "v2"))
-    metadata.setdefault("processed_at", str(int(time.time())))
-
-    # Merge technical metadata (file-derived, not AI-derived) so editors
-    # can filter by camera_make / camera_model in Resolve Smart Bins.
     info = FrameExtractor._get_video_info(video_path) or {}
-    if info.get("camera_make"):
-        metadata["camera_make"] = info["camera_make"]
-    if info.get("camera_model"):
-        metadata["camera_model"] = info["camera_model"]
-    if info.get("color_label"):
-        metadata["color_space"] = info["color_label"]
+    merge_technical_metadata(
+        metadata, info,
+        tagger_version=tagger_version,
+        schema_version=getattr(analyzer, "schema_version", "v2"),
+    )
 
     row_id = queue.enqueue(video_path, metadata, duration_s=duration)
 

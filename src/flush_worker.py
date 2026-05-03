@@ -66,7 +66,26 @@ class FlushWorker:
                     self._tick()
             except Exception as e:
                 logger.exception(f"flush tick failed: {e}")
+                self._reconnect()
             self._stop.wait(POLL_INTERVAL)
+
+    def _reconnect(self) -> None:
+        """Re-initialize the Resolve connection after a stale object error.
+
+        Resolve COM/RPC objects (Timeline, MediaPoolItem, ProjectManager)
+        become invalid when the user closes a project, switches projects,
+        or restarts Resolve. The next poll cycle will get a fresh connection
+        via get_current_project(), but any cached references in the call
+        stack are now dead. This method exists as a clear signal that we
+        detected and recovered from a stale-object failure.
+        """
+        from resolve_connector import get_resolve
+        logger.info("Reconnecting to Resolve after stale object error")
+        resolve = get_resolve()
+        if resolve is None:
+            self._last_status = "waiting for Resolve (reconnecting)"
+        else:
+            self._last_status = "reconnected to Resolve"
 
     def _tick(self) -> None:
         project = get_current_project()
@@ -74,15 +93,27 @@ class FlushWorker:
             self._last_status = "waiting for Resolve"
             return
 
+        try:
+            project_name = project.GetName()
+        except (AttributeError, TypeError):
+            self._reconnect()
+            return
+
         pending = self.queue.list_pending(limit=BATCH_SIZE)
         if not pending:
-            self._last_status = f"Project: {project.GetName()}"
+            self._last_status = f"Project: {project_name}"
             return
 
         wrote = 0
         skipped = 0
         for row in pending:
-            ok, msg, count = write_for_queue_row(row)
+            try:
+                ok, msg, count = write_for_queue_row(row)
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"Stale Resolve object during write: {e}")
+                self._reconnect()
+                break
+
             if ok:
                 self.queue.mark_written(row["id"])
                 wrote += count
@@ -91,7 +122,6 @@ class FlushWorker:
 
             attempts = self.queue.increment_attempts(row["id"])
             if msg == "no_project":
-                # Resolve closed mid-batch; stop and try again next tick
                 break
             if attempts >= MAX_MATCH_ATTEMPTS:
                 self.queue.mark_skipped(row["id"], msg)
@@ -101,6 +131,6 @@ class FlushWorker:
                 logger.debug(f"defer {row['file_name']} ({msg})")
 
         self._last_status = (
-            f"{project.GetName()}: wrote {wrote}, skipped {skipped}, "
+            f"{project_name}: wrote {wrote}, skipped {skipped}, "
             f"pending {self.queue.count_pending()}"
         )

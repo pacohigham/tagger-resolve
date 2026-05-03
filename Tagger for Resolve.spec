@@ -55,6 +55,14 @@ elif platform.system() == "Linux":
 elif platform.system() == "Windows":
     hidden_imports.append("watchdog.observers.read_directory_changes")
 
+_bin_dir = Path("bin")
+_ffmpeg_datas = []
+if _bin_dir.is_dir():
+    for tool in ("ffmpeg", "ffprobe", "ffmpeg.exe", "ffprobe.exe"):
+        p = _bin_dir / tool
+        if p.exists():
+            _ffmpeg_datas.append((str(p), "bin"))
+
 a = Analysis(
     [str(Path(SRC_DIR) / "main.py")],
     pathex=[SRC_DIR],
@@ -64,7 +72,7 @@ a = Analysis(
         (str(Path(SRC_DIR) / "assets" / "tagger_menubar.png"), "assets"),
         (str(Path(SRC_DIR) / "assets" / "tagger_512.png"), "assets"),
         (str(Path(SRC_DIR) / "assets" / "menubar_frames"), "assets/menubar_frames"),
-    ],
+    ] + _ffmpeg_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -100,7 +108,7 @@ exe = EXE(
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,       # set up later for distribution
-    entitlements_file=None,
+    entitlements_file="entitlements.plist",
 )
 coll = COLLECT(
     exe,
@@ -121,8 +129,8 @@ if platform.system() == "Darwin":
         icon="TaggerResolve.icns",
         bundle_identifier="mov.tagger.taggerresolve",
         info_plist={
-            "CFBundleShortVersionString":  "0.1.0",
-            "CFBundleVersion":             "0.1.0",
+            "CFBundleShortVersionString":  "0.2.0",
+            "CFBundleVersion":             "0.2.0",
             "CFBundleName":                APP_NAME,
             "CFBundleDisplayName":         APP_NAME,
             "LSUIElement":                 False,
