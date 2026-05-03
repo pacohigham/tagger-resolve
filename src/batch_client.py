@@ -230,7 +230,7 @@ class BatchClient:
                 time.sleep(delay)
                 continue
 
-            if resp.status_code in (429, 503):
+            if resp.status_code in (429, 500, 502, 503):
                 retry_after = resp.headers.get("Retry-After")
                 try:
                     delay = int(float(retry_after)) if retry_after else 2 ** attempt
