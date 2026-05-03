@@ -4,12 +4,13 @@
 Ported from Tagger v1.2.4 with cross-platform ffmpeg search and
 without BRAW support (deferred for a future release).
 
-Produces a single 5760x4320 JPEG containing:
-  - 64px metadata header strip (filename, duration, fps, resolution, codec)
-  - N frame tiles in a 3-column grid where N = clamp(int(dur/24)+1, 6, 20)
+Produces a single 1568x1176 JPEG (Haiku's native max resolution) containing:
+  - 28px metadata header strip (filename, duration, fps, resolution, codec)
+  - N frame tiles in a 2-col (<=6 frames) or 3-col (7+) grid
+    where N = clamp(int(dur/24)+1, 6, 20)
   - each tile annotated with its source timecode (HH:MM:SS:FF)
 
-Adaptive JPEG quality keeps file size under 4.8 MB for Claude's 5 MB limit.
+Canvas sized to match Claude Haiku's 1568px long-edge processing limit.
 """
 
 from __future__ import annotations
@@ -480,11 +481,13 @@ def _detect_camera_metadata(format_info: dict, stream_info: dict, filename: str 
 
 
 class FrameExtractor:
-    CANVAS_W = 5760
-    CANVAS_H = 4320
-    CANVAS_COLS = 3
-    CANVAS_CELL_W = CANVAS_W // CANVAS_COLS
-    HEADER_H = 64
+    CANVAS_W = 1568
+    CANVAS_H = 1176
+    HEADER_H = 28
+
+    @staticmethod
+    def _cols_for(n_frames: int) -> int:
+        return 2 if n_frames <= 6 else 3
 
     @staticmethod
     def get_framerate(video_path: str) -> Optional[float]:
@@ -575,8 +578,8 @@ class FrameExtractor:
         return max(6, min(20, int(duration / 24) + 1))
 
     @staticmethod
-    def _compute_cell_height(n: int) -> int:
-        rows = (n + FrameExtractor.CANVAS_COLS - 1) // FrameExtractor.CANVAS_COLS
+    def _compute_cell_height(n: int, cols: int) -> int:
+        rows = (n + cols - 1) // cols
         return (FrameExtractor.CANVAS_H - FrameExtractor.HEADER_H) // rows
 
     @staticmethod
@@ -594,9 +597,9 @@ class FrameExtractor:
         img = image.copy()
         draw = ImageDraw.Draw(img)
         tc = _seconds_to_timecode(seconds, fps)
-        font_size = max(24, img.width // 64)
+        font_size = max(12, img.width // 40)
         font = _get_font(font_size)
-        padding = max(8, img.width // 240)
+        padding = max(4, img.width // 120)
         try:
             bbox = draw.textbbox((0, 0), tc, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -617,12 +620,12 @@ class FrameExtractor:
             from PIL import Image as PILImage, ImageDraw
         except ImportError:
             return None
-        height = 64
+        height = 28
         bg = (30, 35, 41)
         fg = (255, 255, 255)
         img = PILImage.new("RGB", (grid_width, height), bg)
         draw = ImageDraw.Draw(img)
-        font = _get_font(22)
+        font = _get_font(13)
         name = Path(video_path).name
         dur_m = int(duration // 60)
         dur_s = int(duration % 60)
@@ -638,7 +641,7 @@ class FrameExtractor:
             )
         else:
             text = f"{name}  |  {dur_m}:{dur_s:02d}  |  {fps_str}  |  {res_str}  |  {codec}"
-        draw.text((16, (height - 22) // 2), text, font=font, fill=fg)
+        draw.text((8, (height - 13) // 2), text, font=font, fill=fg)
         return img
 
     @staticmethod
@@ -742,9 +745,9 @@ class FrameExtractor:
         if not cells:
             return None, None
 
-        COLS = FrameExtractor.CANVAS_COLS
-        CELL_W = FrameExtractor.CANVAS_CELL_W
-        CELL_H = FrameExtractor._compute_cell_height(len(cells))
+        COLS = FrameExtractor._cols_for(len(cells))
+        CELL_W = FrameExtractor.CANVAS_W // COLS
+        CELL_H = FrameExtractor._compute_cell_height(len(cells), COLS)
         resized = [c.resize((CELL_W, CELL_H), PILImage.LANCZOS) for c in cells]
         grid_w = FrameExtractor.CANVAS_W
 
@@ -765,12 +768,10 @@ class FrameExtractor:
         temp_dir = tempfile.mkdtemp(prefix="stitch_")
         out_path = os.path.join(temp_dir, "grid.jpg")
 
-        # Anthropic enforces a 5 MB limit on the base64-encoded image. Base64
-        # inflates by ~33%, so the JPEG must stay below ~3.6 MB to fit safely.
         _MAX_BYTES = 3_600_000
-        quality = 85
+        quality = 95
         canvas.save(out_path, "JPEG", quality=quality)
-        while os.path.getsize(out_path) > _MAX_BYTES and quality > 40:
+        while os.path.getsize(out_path) > _MAX_BYTES and quality > 70:
             quality -= 5
             canvas.save(out_path, "JPEG", quality=quality)
 
