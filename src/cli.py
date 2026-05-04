@@ -231,11 +231,20 @@ def cmd_uninstall() -> int:
     app_path = Path("/Applications/Tagger for Resolve.app")
     data_dir = app_dir()
 
+    has_keychain = False
+    try:
+        import keyring
+        has_keychain = bool(keyring.get_password("TaggerForResolve", "license_key"))
+    except Exception:
+        pass
+
     found = []
     if app_path.exists():
         found.append(str(app_path))
     if data_dir.exists():
         found.append(str(data_dir))
+    if has_keychain:
+        found.append("License key from Keychain")
 
     if not found:
         print("Tagger for Resolve is not installed.")
@@ -255,6 +264,13 @@ def cmd_uninstall() -> int:
     if data_dir.exists():
         shutil.rmtree(data_dir)
         print(f"  Removed {data_dir}")
+
+    try:
+        import keyring
+        keyring.delete_password("TaggerForResolve", "license_key")
+        print("  Removed license key from Keychain")
+    except Exception:
+        pass
 
     print("Uninstall complete.")
     return 0

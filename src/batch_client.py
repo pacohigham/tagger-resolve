@@ -86,6 +86,8 @@ class BatchClient:
         schema_version: str = "v2",
         timeout: int = 60,
     ):
+        if not proxy_url.startswith("https://"):
+            raise ValueError(f"proxy_url must use HTTPS (got {proxy_url!r})")
         self.proxy_url = proxy_url.rstrip("/")
         self.license_key = license_key
         self.hardware_id = hardware_id

@@ -46,14 +46,20 @@ hidden_imports = [
     "PIL.Image",
     "PIL.ImageDraw",
     "PIL.ImageFont",
+    # keyring + OS backends
+    "keyring",
+    "keyring.backends",
 ]
 
 if platform.system() == "Darwin":
     hidden_imports.append("watchdog.observers.fsevents")
+    hidden_imports.append("keyring.backends.macOS")
 elif platform.system() == "Linux":
     hidden_imports.append("watchdog.observers.inotify")
+    hidden_imports.append("keyring.backends.SecretService")
 elif platform.system() == "Windows":
     hidden_imports.append("watchdog.observers.read_directory_changes")
+    hidden_imports.append("keyring.backends.Windows")
 
 _bin_dir = Path("bin")
 _ffmpeg_datas = []

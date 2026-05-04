@@ -3,3 +3,4 @@ watchdog>=3.0.0
 Pillow>=10.0.0
 pystray>=0.19.5
 numpy>=1.24.0
+keyring>=25.0.0

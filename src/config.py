@@ -22,6 +22,15 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
+try:
+    import keyring
+    _HAS_KEYRING = True
+except ImportError:
+    _HAS_KEYRING = False
+
+_KEYRING_SERVICE = "TaggerForResolve"
+_KEYRING_ACCOUNT = "license_key"
+
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
 )
@@ -110,6 +119,11 @@ class Config:
             return cls()
         known = {f.name for f in cls.__dataclass_fields__.values()}
         cfg = cls(**{k: v for k, v in data.items() if k in known})
+        stored_key = _get_keyring_license()
+        if stored_key:
+            cfg.license_key = stored_key
+        elif cfg.license_key:
+            _set_keyring_license(cfg.license_key)
         if cfg._ensure_hardware_id():
             cfg.save()
         return cfg
@@ -123,6 +137,30 @@ class Config:
         return True
 
     def save(self) -> None:
+        if self.license_key:
+            _set_keyring_license(self.license_key)
         path = config_path()
+        data = asdict(self)
+        data.pop("license_key", None)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(asdict(self), f, indent=2)
+            json.dump(data, f, indent=2)
+
+
+def _get_keyring_license() -> str:
+    if not _HAS_KEYRING:
+        return ""
+    try:
+        val = keyring.get_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT)
+        return val or ""
+    except Exception as e:
+        logger.warning(f"Keychain read failed, falling back to config: {e}")
+        return ""
+
+
+def _set_keyring_license(key: str) -> None:
+    if not _HAS_KEYRING:
+        return
+    try:
+        keyring.set_password(_KEYRING_SERVICE, _KEYRING_ACCOUNT, key)
+    except Exception as e:
+        logger.warning(f"Keychain write failed: {e}")
