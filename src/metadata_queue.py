@@ -143,7 +143,33 @@ class MetadataQueue:
                 (status, error, time.time(), row_id),
             )
 
-    def purge_written(self, older_than_seconds: float = 7 * 24 * 3600) -> int:
+    def lookup_written(self, file_name: str, duration_s: float | None = None,
+                       tolerance: float = 0.5) -> dict | None:
+        """Find the most recent written row matching filename and duration."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM queue WHERE file_name = ? AND status = 'written' "
+                "ORDER BY updated_at DESC",
+                (file_name,),
+            ).fetchall()
+        if not rows:
+            return None
+        if duration_s is None:
+            return self._row_to_dict(rows[0])
+        for r in rows:
+            if r["duration_s"] is not None and abs(r["duration_s"] - duration_s) <= tolerance:
+                return self._row_to_dict(r)
+        return self._row_to_dict(rows[0])
+
+    def list_written_filenames(self) -> set[str]:
+        """Return the set of file_name values with status='written'."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT file_name FROM queue WHERE status = 'written'"
+            ).fetchall()
+        return {r["file_name"] for r in rows}
+
+    def purge_written(self, older_than_seconds: float = 365 * 24 * 3600) -> int:
         """Delete written rows older than the cutoff. Returns rows deleted."""
         cutoff = time.time() - older_than_seconds
         with self._lock, self._connect() as conn:

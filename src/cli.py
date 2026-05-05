@@ -182,6 +182,57 @@ def cmd_batch(cfg: Config, queue: MetadataQueue, paths: list[str], version: str)
     return 0
 
 
+def cmd_apply_cached(queue: MetadataQueue) -> int:
+    from resolve_connector import get_current_project
+    from resolve_writer import (
+        _walk_clips, _clip_filename, _clip_duration_seconds,
+        write_metadata_to_clip,
+    )
+
+    project = get_current_project()
+    if project is None:
+        print("No Resolve project is open.", file=sys.stderr)
+        return 1
+
+    project_name = project.GetName()
+    cached_names = queue.list_written_filenames()
+    if not cached_names:
+        print("No cached metadata in database.")
+        return 0
+
+    clips = list(_walk_clips(project.GetMediaPool().GetRootFolder()))
+    cached_lower = {n.lower() for n in cached_names}
+    applied = 0
+    skipped = 0
+
+    for clip in clips:
+        name = _clip_filename(clip)
+        if not name or name.lower() not in cached_lower:
+            continue
+
+        existing = clip.GetMetadata() or {}
+        if existing.get("Keywords"):
+            skipped += 1
+            continue
+
+        dur = _clip_duration_seconds(clip)
+        row = queue.lookup_written(name, dur)
+        if row is None:
+            continue
+
+        ok, msg = write_metadata_to_clip(clip, row["metadata"])
+        if ok:
+            applied += 1
+            print(f"  Applied: {name}")
+        else:
+            print(f"  Failed:  {name}: {msg}")
+
+    if applied:
+        save_and_reload_project(project_name)
+    print(f"\nApplied cached tags to {applied} clips, skipped {skipped} (already tagged).")
+    return 0
+
+
 def cmd_clear_metadata() -> None:
     from resolve_connector import get_current_project
     from resolve_writer import _walk_clips

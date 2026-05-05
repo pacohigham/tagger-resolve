@@ -262,6 +262,60 @@ def run_tray(cfg: Config, queue: MetadataQueue, version: str) -> int:
         else:
             subprocess.Popen(["xdg-open", p])
 
+    def apply_cached_tags(icon, item):
+        def _run():
+            from resolve_connector import get_current_project
+            from resolve_writer import _walk_clips, _clip_filename, _clip_duration_seconds, write_metadata_to_clip
+
+            project = get_current_project()
+            if project is None:
+                logger.warning("Apply Cached Tags: no Resolve project is open")
+                return
+
+            project_name = project.GetName()
+            cached_names = queue.list_written_filenames()
+            if not cached_names:
+                logger.info("Apply Cached Tags: no cached metadata in database")
+                return
+
+            clips = list(_walk_clips(project.GetMediaPool().GetRootFolder()))
+            applied = 0
+            skipped = 0
+
+            _processing_count_inc()
+            try:
+                for clip in clips:
+                    name = _clip_filename(clip)
+                    if not name or name.lower() not in {n.lower() for n in cached_names}:
+                        continue
+
+                    existing = clip.GetMetadata() or {}
+                    if existing.get("Keywords"):
+                        skipped += 1
+                        continue
+
+                    dur = _clip_duration_seconds(clip)
+                    row = queue.lookup_written(name, dur)
+                    if row is None:
+                        continue
+
+                    ok, msg = write_metadata_to_clip(clip, row["metadata"])
+                    if ok:
+                        applied += 1
+                        logger.info(f"  Cached: {name}: {msg}")
+                    else:
+                        logger.warning(f"  Cache write failed: {name}: {msg}")
+
+                if applied:
+                    save_and_reload_project(project_name)
+                logger.info(f"Apply Cached Tags: applied {applied}, skipped {skipped} (already tagged)")
+            except Exception as e:
+                logger.exception(f"Apply Cached Tags failed: {e}")
+            finally:
+                _processing_count_dec()
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def clear_tagger_metadata(icon, item):
         from cli import cmd_clear_metadata
         cmd_clear_metadata()
@@ -276,6 +330,7 @@ def run_tray(cfg: Config, queue: MetadataQueue, version: str) -> int:
         pystray.MenuItem(worker_status, None, enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Tag Open Project", tag_open_project),
+        pystray.MenuItem("Apply Cached Tags", apply_cached_tags),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(watch_folder_label, set_watch_folder),
         pystray.Menu.SEPARATOR,

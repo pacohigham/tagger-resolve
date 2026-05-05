@@ -20,7 +20,7 @@ import sys
 from config import Config, db_path, log_path
 from metadata_queue import MetadataQueue
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -55,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-from-resolve", action="store_true",
                         help="Batch-process every clip in the open Resolve project's Media Pool")
     parser.add_argument("--flush-once", action="store_true", help="Run one flush tick and exit")
+    parser.add_argument("--apply-cached", action="store_true",
+                        help="Re-apply cached metadata to clips in the open Resolve project")
     parser.add_argument("--clear-metadata", action="store_true",
                         help="Clear all Tagger metadata from the open Resolve project and reload it")
     parser.add_argument("--uninstall", action="store_true",
@@ -68,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from cli import (
         cmd_validate, cmd_status, cmd_process_file, cmd_batch,
-        cmd_flush_once, cmd_clear_metadata, cmd_uninstall,
+        cmd_flush_once, cmd_apply_cached, cmd_clear_metadata, cmd_uninstall,
     )
 
     if args.validate:
@@ -92,6 +94,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_batch(cfg, queue, paths, VERSION)
     if args.flush_once:
         return cmd_flush_once(queue)
+    if args.apply_cached:
+        return cmd_apply_cached(queue)
     if args.clear_metadata:
         cmd_clear_metadata()
         return 0
