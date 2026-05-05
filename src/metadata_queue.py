@@ -169,7 +169,7 @@ class MetadataQueue:
             ).fetchall()
         return {r["file_name"] for r in rows}
 
-    def purge_written(self, older_than_seconds: float = 365 * 24 * 3600) -> int:
+    def purge_written(self, older_than_seconds: float = 3 * 365 * 24 * 3600) -> int:
         """Delete written rows older than the cutoff. Returns rows deleted."""
         cutoff = time.time() - older_than_seconds
         with self._lock, self._connect() as conn:
